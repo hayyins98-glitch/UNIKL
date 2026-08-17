@@ -1,4 +1,10 @@
-from .metrics import dice_coefficient, dice_loss
+from .metrics import (
+    dice_coefficient,
+    dice_loss,
+    summarize_survival_errors,
+    survival_absolute_errors_days,
+)
+from .losses import masked_survival_loss
 from .helpers import set_seed, ensure_dir, format_duration
 from .mask_analysis import (
     ComponentAnalysis,
@@ -13,6 +19,9 @@ from .mask_analysis import (
 __all__ = [
     "dice_coefficient",
     "dice_loss",
+    "masked_survival_loss",
+    "summarize_survival_errors",
+    "survival_absolute_errors_days",
     "set_seed",
     "ensure_dir",
     "format_duration",

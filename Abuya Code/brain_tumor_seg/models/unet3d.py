@@ -7,6 +7,8 @@ Architecture overview:
 Input:  (batch, 4, D, H, W)   — 4 MRI modalities
 Output: (batch, 1, D, H, W)   — tumor probability map
 """
+from typing import Tuple
+
 import torch
 import torch.nn as nn
 
@@ -40,6 +42,10 @@ class UNet3D(nn.Module):
     def __init__(self, in_channels: int = 4, out_channels: int = 1, base_features: int = 16):
         super().__init__()
 
+        # Width of the bottleneck feature map, published so heads attached to it
+        # (see models/multitask.py) do not have to re-derive the arithmetic.
+        self.bottleneck_channels = base_features * 8
+
         # Encoder
         self.enc1 = ConvBlock3D(in_channels, base_features)
         self.pool1 = nn.MaxPool3d(2)
@@ -64,7 +70,21 @@ class UNet3D(nn.Module):
         # Final 1x1x1 convolution -> single output channel
         self.out_conv = nn.Conv3d(base_features, out_channels, kernel_size=1)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward_features(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Run the full U-Net and also hand back the bottleneck activations.
+
+        The bottleneck is the most compressed view the network has. The
+        survival head pools it *inside the tumor mask*, so the per-patient
+        prediction is based on the mass rather than the whole brain.
+
+        Args:
+            x: Input volume of shape (batch, in_channels, D, H, W).
+
+        Returns:
+            (segmentation logits, bottleneck features of shape
+            (batch, bottleneck_channels, D/8, H/8, W/8)).
+        """
         # Encoder path (save skip connections)
         e1 = self.enc1(x)
         e2 = self.enc2(self.pool1(e1))
@@ -83,4 +103,7 @@ class UNet3D(nn.Module):
         d1 = self.up1(d2)
         d1 = self.dec1(torch.cat([d1, e1], dim=1))
 
-        return self.out_conv(d1)
+        return self.out_conv(d1), b
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.forward_features(x)[0]

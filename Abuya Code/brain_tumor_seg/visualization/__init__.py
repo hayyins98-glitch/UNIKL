@@ -9,6 +9,12 @@ from .viewer3d import (
     show_3d,
     show_volume_3d,
 )
+from .survival import (
+    describe_case_survival,
+    format_survival,
+    plot_survival_distribution,
+    print_survival_report,
+)
 
 __all__ = [
     "VolumeVisualizer",
@@ -22,4 +28,8 @@ __all__ = [
     "interaction_config",
     "resolve_renderer",
     "INTERACTION_CONFIG",
+    "describe_case_survival",
+    "format_survival",
+    "plot_survival_distribution",
+    "print_survival_report",
 ]

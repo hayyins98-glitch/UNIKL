@@ -38,6 +38,15 @@ VAL_DIR = DATA_ROOT / "Validation"
 MODALITIES = ["t1c", "t1n", "t2f", "t2w"]
 
 # ---------------------------------------------------------------------------
+# Survival metadata
+# ---------------------------------------------------------------------------
+# The metadata TSV sits next to the case folders. Only the subject ID and the
+# overall survival column are used; the other clinical columns are ignored.
+SURVIVAL_METADATA_PATH = DATA_ROOT / "BraTS-PEDs_metadata(Survival rate).tsv"
+SURVIVAL_ID_COLUMN = "BraTS-SubjectID"
+SURVIVAL_DAYS_COLUMN = "Overall survival (days)"
+
+# ---------------------------------------------------------------------------
 # Data settings
 # ---------------------------------------------------------------------------
 # Volumes are resized to this shape for training (depth, height, width)
@@ -55,6 +64,22 @@ BATCH_SIZE = 1          # 3D volumes are memory-heavy; keep batch size small
 NUM_EPOCHS = 20
 LEARNING_RATE = 1e-4
 NUM_WORKERS = 0         # 0 is safest on Windows
+
+# ---------------------------------------------------------------------------
+# Survival head settings
+# ---------------------------------------------------------------------------
+# Turns the second (survival regression) head on. Only ~115 of the 257 training
+# cases carry a survival label, so the survival loss is masked per sample
+# instead of dropping the unlabeled cases from segmentation training.
+PREDICT_SURVIVAL = True
+
+# Segmentation stays the primary task. Survival labels are sparse and noisy, so
+# their loss is scaled down to keep it from dominating the BCE + Dice gradient.
+SURVIVAL_LOSS_WEIGHT = 0.3
+
+# log1p mean/std of the survival target, saved next to the checkpoints so that
+# inference can convert a normalized prediction back into days.
+SURVIVAL_STATS_FILENAME = "survival_stats.json"
 
 # Where to save model checkpoints and plots
 OUTPUT_DIR = PROJECT_ROOT / "outputs"
