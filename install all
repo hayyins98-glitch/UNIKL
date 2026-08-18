@@ -1,0 +1,1 @@
+pip install torch torchvision torchaudio numpy pandas matplotlib plotly ipywidgets scikit-learn SimpleITK
