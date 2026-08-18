@@ -28,8 +28,10 @@ architecture here (MONAI UNet, in_channels=4, out_channels=1) must match
 whatever architecture that checkpoint was trained with, or loading will
 fail with a state_dict mismatch error.
 """
+import re
 import sys
 import tempfile
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -38,7 +40,7 @@ import nibabel as nib
 import torch
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
-from scipy.ndimage import gaussian_filter
+from scipy.ndimage import gaussian_filter, label as ndi_label, center_of_mass as ndi_center_of_mass
 from skimage.filters import threshold_otsu
 from skimage.measure import marching_cubes
 import plotly.graph_objects as go
@@ -47,7 +49,7 @@ from PySide6.QtCore import Qt, QUrl
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QFrame, QFileDialog, QSizePolicy, QSlider, QMessageBox,
-    QProgressBar
+    QProgressBar, QComboBox
 )
 from PySide6.QtWebEngineWidgets import QWebEngineView
 
@@ -135,6 +137,28 @@ QPushButton {{
 QPushButton:hover {{
     color: {ACCENT_TEAL_SOFT};
     background-color: #3a3a3c;
+}}
+"""
+
+FILE_SELECTOR_STYLE = f"""
+QComboBox {{
+    border: none;
+    border-radius: 14px;
+    padding: 8px {SPACING}px;
+    background-color: {BG_PANEL};
+    color: {TEXT_LIGHT};
+}}
+QComboBox::drop-down {{
+    border: none;
+    width: 24px;
+}}
+QComboBox QAbstractItemView {{
+    background-color: {BG_PANEL};
+    color: {TEXT_LIGHT};
+    selection-background-color: {ACCENT_TEAL};
+    border: none;
+    outline: none;
+    padding: 4px;
 }}
 """
 
@@ -431,6 +455,12 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Brain Tumor Viewer")
         self._size_to_screen()
 
+        # Current case state — shared between "Enter image" and "Run
+        # segmentation" so picking a patient folder once is enough for both.
+        self.current_folder: Optional[Path] = None
+        self._nii_files: list = []
+        self._current_report: Optional[dict] = None
+
         central = QWidget()
 
         # ---------------- Left column: image input + patient record -------
@@ -446,6 +476,15 @@ class MainWindow(QMainWindow):
         )
         self.enter_image_btn.clicked.connect(self.on_enter_image)
         left.addWidget(self.enter_image_btn)
+
+        # Lists every .nii/.nii.gz file found in the selected folder;
+        # switching the selection re-previews that file in the 2D panels.
+        # Hidden until a folder with at least one match has been loaded.
+        self.file_selector = QComboBox()
+        self.file_selector.setStyleSheet(FILE_SELECTOR_STYLE)
+        self.file_selector.setVisible(False)
+        self.file_selector.currentIndexChanged.connect(self.on_file_selected)
+        left.addWidget(self.file_selector)
 
         # Primary action gets the one filled accent button in this view
         # (Apple's restraint pattern: exactly one solid-accent button per
@@ -475,6 +514,43 @@ class MainWindow(QMainWindow):
 
         self.patients_record_panel = PanelBox("Patients record", min_height=150)
         left.addWidget(self.patients_record_panel)
+
+        # Report summary — built only from what a single whole-tumor mask
+        # can honestly support (see _compute_report). Left-aligned body
+        # text, unlike the centered titles on the 2D/3D panels, since this
+        # is read top-to-bottom like a small document rather than glanced
+        # at like a chart title.
+        self.report_frame = QFrame()
+        self.report_frame.setStyleSheet(_panel_style())
+        self.report_frame.setMinimumHeight(150)
+        report_layout = QVBoxLayout(self.report_frame)
+        report_layout.setContentsMargins(SPACING, SPACING, SPACING, SPACING)
+        report_layout.setSpacing(6)
+
+        report_title = QLabel("Report summary")
+        report_title.setStyleSheet(f"border: none; color: {TEXT_LIGHT}; font-size: 13px; font-weight: 600;")
+        report_layout.addWidget(report_title)
+
+        self.report_body_label = QLabel("Run segmentation to generate a report.")
+        self.report_body_label.setWordWrap(True)
+        self.report_body_label.setStyleSheet(f"border: none; color: {TEXT_MUTED}; font-size: 11px;")
+        report_layout.addWidget(self.report_body_label)
+        report_layout.addStretch()
+
+        left.addWidget(self.report_frame)
+
+        self.export_report_btn = QPushButton("Export PDF report")
+        self.export_report_btn.setEnabled(False)
+        self.export_report_btn.setStyleSheet(
+            f"QPushButton {{ border: none; border-radius: 14px; "
+            f"padding: 10px {SPACING}px; background-color: {BG_PANEL}; color: {ACCENT_TEAL}; font-weight: 500; }}"
+            f"QPushButton:hover {{ background-color: #3a3a3c; }}"
+            f"QPushButton:pressed {{ background-color: #48484a; }}"
+            f"QPushButton:disabled {{ color: {TEXT_MUTED}; }}"
+        )
+        self.export_report_btn.clicked.connect(self.on_export_report)
+        left.addWidget(self.export_report_btn)
+
         left.addStretch()
 
         self.left_container = QWidget()
@@ -491,9 +567,9 @@ class MainWindow(QMainWindow):
         center = QVBoxLayout()
         center.setSpacing(SPACING)
         # axis 0 = L-R (sagittal), axis 1 = A-P (coronal), axis 2 = S-I (axial)
-        self.sagittal_panel = SlicePanel("Sagittal", axis=0, min_height=140)
-        self.axial_panel = SlicePanel("Axial", axis=2, min_height=140)
-        self.coronal_panel = SlicePanel("Coronal", axis=1, min_height=140)
+        self.sagittal_panel = SlicePanel("2D sagittal view", axis=0, min_height=140)
+        self.axial_panel = SlicePanel("2D axial view", axis=2, min_height=140)
+        self.coronal_panel = SlicePanel("2D coronal view", axis=1, min_height=140)
         center.addWidget(self.sagittal_panel, stretch=1)
         center.addWidget(self.axial_panel, stretch=1)
         center.addWidget(self.coronal_panel, stretch=1)
@@ -577,13 +653,19 @@ class MainWindow(QMainWindow):
         self._maximized_panel = panel
 
     def on_run_segmentation(self):
-        folder = QFileDialog.getExistingDirectory(
-            self, "Select folder with t1, t1ce, t2, flair NIfTI files"
-        )
-        if not folder:
-            return
+        # Reuse the folder already loaded via "Enter image" if there is
+        # one — only prompt when no case is loaded yet, so the two buttons
+        # share a single "current patient" instead of asking twice.
+        if self.current_folder is None:
+            folder = QFileDialog.getExistingDirectory(
+                self, "Select folder with t1, t1ce, t2, flair NIfTI files"
+            )
+            if not folder:
+                return
+            if not self._load_folder(Path(folder)):
+                return
 
-        folder_path = Path(folder)
+        folder_path = self.current_folder
         try:
             modality_paths = self._find_modality_files(folder_path)
             display_volume, model_input, affine = self._load_and_stack(modality_paths)
@@ -619,9 +701,10 @@ class MainWindow(QMainWindow):
         self.axial_panel.set_mask(mask)
         self.coronal_panel.set_mask(mask)
 
-        voxel_vol_cm3 = self._voxel_volume_cm3(affine)
-        tumor_cm3 = float(mask.sum()) * voxel_vol_cm3
-        self.status_label.setText(f"Tumor volume: {tumor_cm3:.2f} cm\u00b3")
+        self.status_label.setText("Segmentation complete.")
+
+        report = self._compute_report(mask, display_volume, affine)
+        self._update_report_panel(report)
 
         self._update_3d_views(display_volume, mask, affine)
         self.busy_bar.hide()
@@ -664,8 +747,6 @@ class MainWindow(QMainWindow):
         (t1n=T1 native, t1c=T1 post-contrast, t2w=T2-weighted, t2f=T2-FLAIR —
         matching the MODALITIES list in your existing config.py)
         """
-        import re
-
         tag_options = {
             "t1": ["t1n", "t1"],
             "t1ce": ["t1c", "t1ce"],
@@ -797,15 +878,211 @@ class MainWindow(QMainWindow):
         voxel_volume_mm3 = float(np.prod(voxel_dims_mm))
         return voxel_volume_mm3 / 1000.0
 
-    def on_enter_image(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Select MRI volume", "", "NIfTI files (*.nii *.nii.gz);;All files (*)"
-        )
+    def _compute_report(self, mask: np.ndarray, display_volume: np.ndarray, affine: np.ndarray) -> dict:
+        """
+        Builds the metrics that a single whole-tumor binary mask can
+        honestly support. This model predicts one class only, so tumor
+        core and edema are NOT included here — those need a retrained
+        multi-class (WT/TC/ET) model, since they can't be derived from a
+        single mask after the fact.
+        """
+        voxel_vol_cm3 = self._voxel_volume_cm3(affine)
+        total_voxels = int(mask.sum())
+        total_cm3 = total_voxels * voxel_vol_cm3
+
+        _, n_components = ndi_label(mask > 0.5)
+
+        if total_voxels > 0:
+            centroid = np.array(ndi_center_of_mass(mask))
+            shape = np.array(mask.shape)
+            rel = (centroid - shape / 2.0) / (shape / 2.0)  # -1..1 per axis
+
+            # Assumes BraTS-style axis ordering (0=L-R, 1=A-P, 2=S-I), same
+            # assumption already used for the sagittal/coronal/axial panels.
+            # This isn't verified against the file's own orientation, so
+            # it's a rough geometric description relative to the volume's
+            # center, not a clinically confirmed laterality reading.
+            lr = "right" if rel[0] > 0.1 else ("left" if rel[0] < -0.1 else "midline")
+            ap = "posterior" if rel[1] > 0.1 else ("anterior" if rel[1] < -0.1 else "central")
+            si = "superior" if rel[2] > 0.1 else ("inferior" if rel[2] < -0.1 else "central")
+            location = f"{lr}, {ap}, {si} (approximate)"
+        else:
+            location = "n/a — no tumor voxels detected"
+
+        try:
+            brain_level = float(threshold_otsu(display_volume))
+            brain_voxels = int((display_volume > brain_level).sum())
+            percent_of_brain = (total_voxels / brain_voxels * 100.0) if brain_voxels > 0 else float("nan")
+        except ValueError:
+            percent_of_brain = float("nan")
+
+        return {
+            "total_cm3": total_cm3,
+            "n_components": int(n_components),
+            "location": location,
+            "percent_of_brain": percent_of_brain,
+        }
+
+    def _update_report_panel(self, report: dict):
+        self._current_report = report
+        lines = [
+            f"Total lesion volume: {report['total_cm3']:.2f} cm\u00b3",
+            f"Lesion components: {report['n_components']}",
+            f"Approx. location: {report['location']}",
+        ]
+        if not np.isnan(report["percent_of_brain"]):
+            lines.append(f"% of brain volume: {report['percent_of_brain']:.1f}%")
+        self.report_body_label.setText("\n".join(lines))
+        self.export_report_btn.setEnabled(True)
+
+    def on_export_report(self):
+        if not self._current_report:
+            return
+
+        default_name = f"{self.current_folder.name if self.current_folder else 'patient'}_report.pdf"
+        path, _ = QFileDialog.getSaveFileName(self, "Save PDF report", default_name, "PDF files (*.pdf)")
         if not path:
             return
 
         try:
-            volume = self._load_volume(path)
+            self._export_pdf(path, self._current_report)
+        except Exception as exc:
+            QMessageBox.critical(self, "Failed to export report", str(exc))
+            return
+
+        QMessageBox.information(self, "Report exported", f"Saved to:\n{path}")
+
+    def _export_pdf(self, path: str, report: dict):
+        """
+        Builds a one-page PDF summary using reportlab. Kept as a local
+        import since this is the only place in the file that needs it —
+        matches the "load heavy dependencies where they're used" pattern
+        already used for the MONAI import in _get_model().
+        """
+        from reportlab.lib import colors
+        from reportlab.lib.pagesizes import letter
+        from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+        from reportlab.lib.units import inch
+        from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+
+        doc = SimpleDocTemplate(path, pagesize=letter, topMargin=0.6 * inch, bottomMargin=0.6 * inch)
+        styles = getSampleStyleSheet()
+        title_style = ParagraphStyle("TitleCustom", parent=styles["Title"], fontSize=16)
+        disclaimer_style = ParagraphStyle(
+            "Disclaimer", parent=styles["Normal"], fontSize=8, textColor=colors.HexColor("#8a1c1c")
+        )
+
+        disclaimer = (
+            "This report is generated by an automated research pipeline and is NOT a "
+            "diagnostic or clinical report. It has not been reviewed by a radiologist. "
+            "The current model predicts whole-tumor extent only \u2014 tumor core and edema "
+            "sub-regions are not available without a retrained multi-class model. Location "
+            "is a rough geometric estimate relative to the volume center, not a confirmed "
+            "anatomical reading."
+        )
+
+        story = [
+            Paragraph("Brain Tumor Segmentation \u2014 Report Summary", title_style),
+            Spacer(1, 4),
+            Paragraph(disclaimer, disclaimer_style),
+            Spacer(1, 14),
+        ]
+
+        patient_code = self.current_folder.name if self.current_folder else "unknown"
+        meta_table = Table(
+            [
+                ["Patient / case folder", patient_code],
+                ["Report generated", datetime.now().strftime("%Y-%m-%d %H:%M")],
+            ],
+            colWidths=[2 * inch, 4 * inch],
+        )
+        meta_table.setStyle(TableStyle([
+            ("FONTSIZE", (0, 0), (-1, -1), 10),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+            ("TEXTCOLOR", (0, 0), (0, -1), colors.grey),
+        ]))
+        story.append(meta_table)
+        story.append(Spacer(1, 16))
+
+        story.append(Paragraph("Metrics", styles["Heading2"]))
+        percent_text = (
+            f"{report['percent_of_brain']:.1f}%" if not np.isnan(report["percent_of_brain"]) else "n/a"
+        )
+        metric_table = Table(
+            [
+                ["Metric", "Value"],
+                ["Total lesion volume", f"{report['total_cm3']:.2f} cm\u00b3"],
+                ["Lesion components", str(report["n_components"])],
+                ["Approximate location", report["location"]],
+                ["% of brain volume", percent_text],
+            ],
+            colWidths=[2.5 * inch, 3 * inch],
+        )
+        metric_table.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#2c3e50")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("FONTSIZE", (0, 0), (-1, -1), 10),
+            ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f2f2f2")]),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+            ("TOPPADDING", (0, 0), (-1, -1), 6),
+        ]))
+        story.append(metric_table)
+
+        doc.build(story)
+
+    def on_enter_image(self):
+        folder = QFileDialog.getExistingDirectory(self, "Select patient folder")
+        if not folder:
+            return
+        self._load_folder(Path(folder))
+
+    def _load_folder(self, folder_path: Path) -> bool:
+        """
+        Scans a patient folder for every .nii/.nii.gz file, populates the
+        file selector dropdown with all of them, and previews a sensible
+        default (a FLAIR-tagged file if present, else the first one found).
+        Shared by "Enter image" and "Run segmentation" so both act on the
+        same current case. Returns False (with a dialog shown) if the
+        folder has no matching files.
+        """
+        nii_files = sorted(folder_path.glob("*.nii*"))
+        if not nii_files:
+            QMessageBox.warning(
+                self, "No images found",
+                f"No .nii or .nii.gz files found in:\n{folder_path}"
+            )
+            return False
+
+        self.current_folder = folder_path
+        self._nii_files = nii_files
+
+        self.file_selector.blockSignals(True)
+        self.file_selector.clear()
+        self.file_selector.addItems([f.name for f in nii_files])
+        self.file_selector.blockSignals(False)
+        self.file_selector.setVisible(True)
+
+        # Prefer previewing the FLAIR volume by default — it's the same
+        # background volume Run segmentation displays results on, so the
+        # preview matches what you'll see after running the model.
+        default_index = 0
+        for i, f in enumerate(nii_files):
+            if re.search(r"[_-](t2f|flair)[_.]", f.name, re.IGNORECASE):
+                default_index = i
+                break
+
+        self.file_selector.setCurrentIndex(default_index)
+        self._load_and_display(nii_files[default_index])
+        return True
+
+    def on_file_selected(self, index: int):
+        if 0 <= index < len(self._nii_files):
+            self._load_and_display(self._nii_files[index])
+
+    def _load_and_display(self, path: Path):
+        try:
+            volume = self._load_volume(str(path))
         except Exception as exc:
             QMessageBox.critical(self, "Failed to load volume", str(exc))
             return
