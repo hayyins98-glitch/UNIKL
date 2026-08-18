@@ -28,6 +28,7 @@ architecture here (MONAI UNet, in_channels=4, out_channels=1) must match
 whatever architecture that checkpoint was trained with, or loading will
 fail with a state_dict mismatch error.
 """
+import re
 import sys
 import tempfile
 from pathlib import Path
@@ -47,7 +48,7 @@ from PySide6.QtCore import Qt, QUrl
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QFrame, QFileDialog, QSizePolicy, QSlider, QMessageBox,
-    QProgressBar
+    QProgressBar, QComboBox
 )
 from PySide6.QtWebEngineWidgets import QWebEngineView
 
@@ -135,6 +136,28 @@ QPushButton {{
 QPushButton:hover {{
     color: {ACCENT_TEAL_SOFT};
     background-color: #3a3a3c;
+}}
+"""
+
+FILE_SELECTOR_STYLE = f"""
+QComboBox {{
+    border: none;
+    border-radius: 14px;
+    padding: 8px {SPACING}px;
+    background-color: {BG_PANEL};
+    color: {TEXT_LIGHT};
+}}
+QComboBox::drop-down {{
+    border: none;
+    width: 24px;
+}}
+QComboBox QAbstractItemView {{
+    background-color: {BG_PANEL};
+    color: {TEXT_LIGHT};
+    selection-background-color: {ACCENT_TEAL};
+    border: none;
+    outline: none;
+    padding: 4px;
 }}
 """
 
@@ -431,6 +454,11 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Brain Tumor Viewer")
         self._size_to_screen()
 
+        # Current case state — shared between "Enter image" and "Run
+        # segmentation" so picking a patient folder once is enough for both.
+        self.current_folder: Optional[Path] = None
+        self._nii_files: list = []
+
         central = QWidget()
 
         # ---------------- Left column: image input + patient record -------
@@ -446,6 +474,15 @@ class MainWindow(QMainWindow):
         )
         self.enter_image_btn.clicked.connect(self.on_enter_image)
         left.addWidget(self.enter_image_btn)
+
+        # Lists every .nii/.nii.gz file found in the selected folder;
+        # switching the selection re-previews that file in the 2D panels.
+        # Hidden until a folder with at least one match has been loaded.
+        self.file_selector = QComboBox()
+        self.file_selector.setStyleSheet(FILE_SELECTOR_STYLE)
+        self.file_selector.setVisible(False)
+        self.file_selector.currentIndexChanged.connect(self.on_file_selected)
+        left.addWidget(self.file_selector)
 
         # Primary action gets the one filled accent button in this view
         # (Apple's restraint pattern: exactly one solid-accent button per
@@ -491,9 +528,9 @@ class MainWindow(QMainWindow):
         center = QVBoxLayout()
         center.setSpacing(SPACING)
         # axis 0 = L-R (sagittal), axis 1 = A-P (coronal), axis 2 = S-I (axial)
-        self.sagittal_panel = SlicePanel("Sagittal", axis=0, min_height=140)
-        self.axial_panel = SlicePanel("Axial", axis=2, min_height=140)
-        self.coronal_panel = SlicePanel("Coronal", axis=1, min_height=140)
+        self.sagittal_panel = SlicePanel("2D sagittal view", axis=0, min_height=140)
+        self.axial_panel = SlicePanel("2D axial view", axis=2, min_height=140)
+        self.coronal_panel = SlicePanel("2D coronal view", axis=1, min_height=140)
         center.addWidget(self.sagittal_panel, stretch=1)
         center.addWidget(self.axial_panel, stretch=1)
         center.addWidget(self.coronal_panel, stretch=1)
@@ -577,13 +614,19 @@ class MainWindow(QMainWindow):
         self._maximized_panel = panel
 
     def on_run_segmentation(self):
-        folder = QFileDialog.getExistingDirectory(
-            self, "Select folder with t1, t1ce, t2, flair NIfTI files"
-        )
-        if not folder:
-            return
+        # Reuse the folder already loaded via "Enter image" if there is
+        # one — only prompt when no case is loaded yet, so the two buttons
+        # share a single "current patient" instead of asking twice.
+        if self.current_folder is None:
+            folder = QFileDialog.getExistingDirectory(
+                self, "Select folder with t1, t1ce, t2, flair NIfTI files"
+            )
+            if not folder:
+                return
+            if not self._load_folder(Path(folder)):
+                return
 
-        folder_path = Path(folder)
+        folder_path = self.current_folder
         try:
             modality_paths = self._find_modality_files(folder_path)
             display_volume, model_input, affine = self._load_and_stack(modality_paths)
@@ -664,8 +707,6 @@ class MainWindow(QMainWindow):
         (t1n=T1 native, t1c=T1 post-contrast, t2w=T2-weighted, t2f=T2-FLAIR —
         matching the MODALITIES list in your existing config.py)
         """
-        import re
-
         tag_options = {
             "t1": ["t1n", "t1"],
             "t1ce": ["t1c", "t1ce"],
@@ -798,14 +839,57 @@ class MainWindow(QMainWindow):
         return voxel_volume_mm3 / 1000.0
 
     def on_enter_image(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Select MRI volume", "", "NIfTI files (*.nii *.nii.gz);;All files (*)"
-        )
-        if not path:
+        folder = QFileDialog.getExistingDirectory(self, "Select patient folder")
+        if not folder:
             return
+        self._load_folder(Path(folder))
 
+    def _load_folder(self, folder_path: Path) -> bool:
+        """
+        Scans a patient folder for every .nii/.nii.gz file, populates the
+        file selector dropdown with all of them, and previews a sensible
+        default (a FLAIR-tagged file if present, else the first one found).
+        Shared by "Enter image" and "Run segmentation" so both act on the
+        same current case. Returns False (with a dialog shown) if the
+        folder has no matching files.
+        """
+        nii_files = sorted(folder_path.glob("*.nii*"))
+        if not nii_files:
+            QMessageBox.warning(
+                self, "No images found",
+                f"No .nii or .nii.gz files found in:\n{folder_path}"
+            )
+            return False
+
+        self.current_folder = folder_path
+        self._nii_files = nii_files
+
+        self.file_selector.blockSignals(True)
+        self.file_selector.clear()
+        self.file_selector.addItems([f.name for f in nii_files])
+        self.file_selector.blockSignals(False)
+        self.file_selector.setVisible(True)
+
+        # Prefer previewing the FLAIR volume by default — it's the same
+        # background volume Run segmentation displays results on, so the
+        # preview matches what you'll see after running the model.
+        default_index = 0
+        for i, f in enumerate(nii_files):
+            if re.search(r"[_-](t2f|flair)[_.]", f.name, re.IGNORECASE):
+                default_index = i
+                break
+
+        self.file_selector.setCurrentIndex(default_index)
+        self._load_and_display(nii_files[default_index])
+        return True
+
+    def on_file_selected(self, index: int):
+        if 0 <= index < len(self._nii_files):
+            self._load_and_display(self._nii_files[index])
+
+    def _load_and_display(self, path: Path):
         try:
-            volume = self._load_volume(path)
+            volume = self._load_volume(str(path))
         except Exception as exc:
             QMessageBox.critical(self, "Failed to load volume", str(exc))
             return
