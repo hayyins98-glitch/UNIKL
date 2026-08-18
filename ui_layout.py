@@ -23,11 +23,17 @@ This file is self-contained: run it directly with `python ui_layout.py`.
 It has no dependency on database.py / inference_worker.py / report_generator.py
 from the earlier scaffold.
 
-MODEL CHECKPOINT: set MODEL_PATH below to your trained .pth file. The
-architecture here (MONAI UNet, in_channels=4, out_channels=1) must match
-whatever architecture that checkpoint was trained with, or loading will
-fail with a state_dict mismatch error.
+MODEL CHECKPOINT: no path to edit in this file anymore — the first time you
+run segmentation, a file dialog asks you to pick your trained .pth file,
+and the choice is remembered in a settings file in your user profile
+(~/.brain_tumor_viewer/settings.json), independent of wherever this
+project folder happens to live. If the saved checkpoint file is later
+moved or deleted, it will prompt again automatically. The architecture
+here (MONAI UNet, in_channels=4, out_channels=1) must match whatever
+architecture that checkpoint was trained with, or loading will fail with
+a state_dict mismatch error.
 """
+import json
 import re
 import sys
 import tempfile
@@ -163,11 +169,39 @@ QComboBox QAbstractItemView {{
 """
 
 # ---------------------------------------------------------------------------
-# Model configuration — adjust to match your trained checkpoint
+# Model configuration
 # ---------------------------------------------------------------------------
-MODEL_PATH = Path(__file__).resolve().parent / "checkpoints" / "best_model.pth"
+# The checkpoint path lives in a small settings file in the user's profile
+# (NOT next to this script), so it survives moving/renaming the project
+# folder — which was breaking MODEL_PATH every time before. If it's unset
+# or the saved file no longer exists, the app prompts once via a file
+# dialog and remembers the answer for every future launch.
+SETTINGS_DIR = Path.home() / ".brain_tumor_viewer"
+SETTINGS_FILE = SETTINGS_DIR / "settings.json"
+
 INFERENCE_SIZE = (128, 128, 128)  # volume is resized to this for the model,
                                    # then the mask is resized back to native size
+
+
+def _load_settings() -> dict:
+    if SETTINGS_FILE.exists():
+        try:
+            return json.loads(SETTINGS_FILE.read_text())
+        except (json.JSONDecodeError, OSError):
+            return {}
+    return {}
+
+
+def _save_settings(settings: dict):
+    SETTINGS_DIR.mkdir(parents=True, exist_ok=True)
+    SETTINGS_FILE.write_text(json.dumps(settings, indent=2))
+
+
+class _ModelSelectionCancelled(Exception):
+    """Raised when the user closes the checkpoint file dialog without
+    picking anything — a cancel, not a real error, so callers should
+    return quietly instead of showing an error dialog."""
+    pass
 
 
 class PanelBox(QFrame):
@@ -501,6 +535,17 @@ class MainWindow(QMainWindow):
         self.run_seg_btn.clicked.connect(self.on_run_segmentation)
         left.addWidget(self.run_seg_btn)
 
+        # Small, quiet control: shows which checkpoint is active and lets
+        # you pick a different one without waiting for it to go missing.
+        self.checkpoint_label = QLabel(self._checkpoint_display_text())
+        self.checkpoint_label.setWordWrap(True)
+        self.checkpoint_label.setStyleSheet(
+            f"font-size: 10px; color: {TEXT_MUTED}; text-decoration: underline;"
+        )
+        self.checkpoint_label.setCursor(Qt.PointingHandCursor)
+        self.checkpoint_label.mousePressEvent = lambda _event: self.on_change_checkpoint()
+        left.addWidget(self.checkpoint_label)
+
         self.busy_bar = QProgressBar()
         self.busy_bar.setRange(0, 0)  # indeterminate — pulses while active
         self.busy_bar.setTextVisible(False)
@@ -675,10 +720,12 @@ class MainWindow(QMainWindow):
 
         try:
             model = self._get_model()
+        except _ModelSelectionCancelled:
+            return  # user closed the checkpoint picker — not an error, just stop quietly
         except Exception as exc:
             QMessageBox.critical(
                 self, "Failed to load model",
-                f"{exc}\n\nExpected checkpoint at:\n{MODEL_PATH}"
+                f"{exc}\n\nCheckpoint path:\n{getattr(self, '_model_path', '(not set)')}"
             )
             return
 
@@ -818,12 +865,57 @@ class MainWindow(QMainWindow):
         tensor = torch.from_numpy(stacked).unsqueeze(0).float()  # [1, 4, D, H, W]
         return display_volume, tensor, affine
 
+    @staticmethod
+    def _checkpoint_display_text() -> str:
+        settings = _load_settings()
+        saved = settings.get("model_path")
+        if saved and Path(saved).exists():
+            return f"Model: {Path(saved).name} (change)"
+        return "Model: not set (click to choose)"
+
+    def on_change_checkpoint(self):
+        """Lets you pick a different checkpoint on demand, rather than only
+        being prompted when the saved one goes missing."""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select trained model checkpoint (.pth)", "", "PyTorch checkpoint (*.pth)"
+        )
+        if not path:
+            return
+        settings = _load_settings()
+        settings["model_path"] = path
+        _save_settings(settings)
+        self._model = None  # force _get_model() to reload from the new path next run
+        self.checkpoint_label.setText(self._checkpoint_display_text())
+
+    def _resolve_model_path(self) -> Path:
+        """
+        Reads the checkpoint path from the persistent settings file. If it's
+        missing or the saved file no longer exists (moved/deleted since last
+        run), prompts once via a file dialog and saves the answer so this
+        only happens again if the checkpoint actually moves again.
+        Raises _ModelSelectionCancelled if the user closes the dialog
+        without picking anything — that's a cancel, not an error.
+        """
+        settings = _load_settings()
+        saved = settings.get("model_path")
+        if saved and Path(saved).exists():
+            return Path(saved)
+
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select trained model checkpoint (.pth)", "", "PyTorch checkpoint (*.pth)"
+        )
+        if not path:
+            raise _ModelSelectionCancelled()
+
+        settings["model_path"] = path
+        _save_settings(settings)
+        return Path(path)
+
     def _get_model(self):
         if getattr(self, "_model", None) is not None:
             return self._model
 
-        if not MODEL_PATH.exists():
-            raise FileNotFoundError(f"Checkpoint not found: {MODEL_PATH}")
+        model_path = self._resolve_model_path()
 
         from monai.networks.nets import UNet
         from monai.networks.layers import Norm
@@ -838,12 +930,14 @@ class MainWindow(QMainWindow):
             norm=Norm.INSTANCE,
         )
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        state_dict = torch.load(MODEL_PATH, map_location=device)
+        state_dict = torch.load(model_path, map_location=device)
         model.load_state_dict(state_dict)
         model.to(device)
         model.eval()
         self._model = model
         self._device = device
+        self._model_path = model_path
+        self.checkpoint_label.setText(self._checkpoint_display_text())
         return model
 
     def _run_model(self, model, model_input: torch.Tensor, target_shape: tuple) -> np.ndarray:
