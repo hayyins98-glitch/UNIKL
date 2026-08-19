@@ -1,32 +1,15 @@
 """
-Standalone UI layout — matches the wireframe:
+Brain Tumor Viewer — layout matches the wireframe:
 
     [Enter image]        [ 2D sagittal ]        [   3D tumor    ]
     [Run segmentation]   [ 2D axial    ]        [               ]
     [Patients record]    [ 2D coronal  ]        [  3D brain view]
-                                                  [               ]
 
-Status:
-  - 2D panels: WIRED — real slices, scroll sliders.
-  - Run segmentation: WIRED — loads a 4-modality folder (BraTS or BraTS-PEDs
-    naming), runs a 3D U-Net checkpoint, overlays the predicted tumor mask
-    in red on the 2D views, and reports tumor volume in cm^3.
-  - 3D panels: WIRED — marching-cubes tumor mesh and brain+tumor render,
-    built after each segmentation run and shown via embedded Plotly (rotate/
-    zoom/pan with the mouse).
-  - Patient record: still a placeholder — next step.
-  - Maximize: WIRED — hides the other panels/columns in place so the
-    maximized panel fills the window. (No popup dialog — avoids a
-    QWebEngineView reparenting quirk that broke centering for 3D panels.)
+Wires the PySide6 shell to `brain_tumor_seg`: the trained 3D U-Net (with
+survival head), the Plotly 3D viewer, and the BraTS-PEDs survival metadata.
 
-This file is self-contained: run it directly with `python ui_layout.py`.
-It has no dependency on database.py / inference_worker.py / report_generator.py
-from the earlier scaffold.
-
-MODEL CHECKPOINT: set MODEL_PATH below to your trained .pth file. The
-architecture here (MONAI UNet, in_channels=4, out_channels=1) must match
-whatever architecture that checkpoint was trained with, or loading will
-fail with a state_dict mismatch error.
+Run from this folder or the project root:
+    python ui_layout.py
 """
 import re
 import sys
@@ -34,23 +17,36 @@ import tempfile
 from pathlib import Path
 from typing import Optional
 
+# Interface/ sits next to brain_tumor_seg/; running this file directly would
+# otherwise miss the package.
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
+
 import numpy as np
 import nibabel as nib
 import torch
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
-from scipy.ndimage import gaussian_filter
-from skimage.filters import threshold_otsu
-from skimage.measure import marching_cubes
+from scipy.ndimage import zoom
 import plotly.graph_objects as go
 
 from PySide6.QtCore import Qt, QUrl
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QFrame, QFileDialog, QSizePolicy, QSlider, QMessageBox,
-    QProgressBar, QComboBox
+    QProgressBar, QComboBox,
 )
 from PySide6.QtWebEngineWidgets import QWebEngineView
+
+from brain_tumor_seg.config import CHECKPOINT_DIR, MODALITIES, TARGET_SHAPE
+from brain_tumor_seg.data.dataset import _normalize
+from brain_tumor_seg.data.survival import load_survival_days, load_survival_stats
+from brain_tumor_seg.evaluation import predict_survival_days
+from brain_tumor_seg.models import MultiTaskUNet3D
+from brain_tumor_seg.models.multitask import run_model, split_model_outputs
+from brain_tumor_seg.visualization.survival import format_survival
+from brain_tumor_seg.visualization.viewer3d import INTERACTION_CONFIG, show_volume_3d
 
 # ---------------------------------------------------------------------------
 # Dark theme palette
@@ -162,19 +158,48 @@ QComboBox QAbstractItemView {{
 """
 
 # ---------------------------------------------------------------------------
-# Model configuration — adjust to match your trained checkpoint
+# Model configuration — uses the project checkpoint and the same volume size
+# the U-Net was trained at (mask is then resized back to native resolution).
 # ---------------------------------------------------------------------------
-MODEL_PATH = Path(__file__).resolve().parent / "checkpoints" / "best_model.pth"
-INFERENCE_SIZE = (128, 128, 128)  # volume is resized to this for the model,
-                                   # then the mask is resized back to native size
+def _resolve_checkpoint() -> Path:
+    candidates = (
+        CHECKPOINT_DIR / "best_model.pth",
+        CHECKPOINT_DIR / "best_model_segmentation_only.pth",
+        Path(__file__).resolve().parent / "checkpoints" / "best_model.pth",
+    )
+    for path in candidates:
+        if path.is_file():
+            return path
+    return candidates[0]
 
 
-class PanelBox(QFrame):
-    """A bordered placeholder panel with a centered label — stands in for a
-    patient record list or any other content area until that content is
-    wired in."""
+MODEL_PATH = _resolve_checkpoint()
+INFERENCE_SIZE = TARGET_SHAPE
+# 3D marching cubes on a native 240^3 volume stalls the UI; downsample first.
+RENDER_MAX_DIM = 96
 
-    def __init__(self, text: str, min_height: int = 150):
+
+def _muted_label(text: str) -> QLabel:
+    label = QLabel(text)
+    label.setStyleSheet(
+        f"border: none; color: {TEXT_MUTED}; font-size: 11px; font-weight: 500;"
+    )
+    return label
+
+
+def _value_label(placeholder: str = "—") -> QLabel:
+    label = QLabel(placeholder)
+    label.setWordWrap(True)
+    label.setStyleSheet(
+        f"border: none; color: {TEXT_LIGHT}; font-size: 13px; font-weight: 500;"
+    )
+    return label
+
+
+class PatientRecordPanel(QFrame):
+    """Case ID, metadata survival, and (after a run) predicted survival."""
+
+    def __init__(self, min_height: int = 150):
         super().__init__()
         self.setFrameShape(QFrame.Box)
         self.setStyleSheet(_panel_style())
@@ -182,10 +207,56 @@ class PanelBox(QFrame):
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
         layout = QVBoxLayout(self)
-        label = QLabel(text)
-        label.setAlignment(Qt.AlignCenter)
-        label.setStyleSheet(f"border: none; color: {TEXT_MUTED}; font-size: 13px;")
-        layout.addWidget(label)
+        layout.setContentsMargins(14, 12, 14, 12)
+        layout.setSpacing(6)
+
+        title = QLabel("Patients record")
+        title.setAlignment(Qt.AlignCenter)
+        title.setStyleSheet(
+            f"border: none; color: {TEXT_LIGHT}; font-size: 13px; font-weight: 500;"
+        )
+        layout.addWidget(title)
+
+        layout.addWidget(_muted_label("Patient ID"))
+        self.case_label = _value_label("No case loaded")
+        layout.addWidget(self.case_label)
+
+        layout.addWidget(_muted_label("Overall survival"))
+        self.survival_label = _value_label("—")
+        layout.addWidget(self.survival_label)
+
+        layout.addWidget(_muted_label("Predicted survival"))
+        self.predicted_label = _value_label("Run segmentation to predict")
+        layout.addWidget(self.predicted_label)
+
+        layout.addWidget(_muted_label("Tumor volume"))
+        self.volume_label = _value_label("—")
+        layout.addWidget(self.volume_label)
+        layout.addStretch()
+
+    def set_case(self, case_id: str, survival_days: Optional[float]) -> None:
+        self.case_label.setText(case_id)
+        if survival_days is None:
+            self.survival_label.setText("No label in metadata")
+        else:
+            self.survival_label.setText(format_survival(survival_days))
+        self.predicted_label.setText("Run segmentation to predict")
+        self.volume_label.setText("—")
+        self.setStyleSheet(_panel_style(ACCENT_TEAL))
+
+    def set_predictions(
+        self,
+        predicted_days: Optional[float],
+        tumor_cm3: Optional[float],
+    ) -> None:
+        if predicted_days is None:
+            self.predicted_label.setText("Unavailable (no survival head)")
+        else:
+            self.predicted_label.setText(format_survival(predicted_days))
+        if tumor_cm3 is None:
+            self.volume_label.setText("—")
+        else:
+            self.volume_label.setText(f"{tumor_cm3:.2f} cm\u00b3")
 
 
 class SlicePanel(QFrame):
@@ -360,7 +431,12 @@ class Panel3D(QFrame):
             self._layout.addWidget(self.web_view, stretch=1)
 
         tmp = tempfile.NamedTemporaryFile(suffix=".html", delete=False)
-        fig.write_html(tmp.name, include_plotlyjs=True, full_html=True)
+        fig.write_html(
+            tmp.name,
+            include_plotlyjs=True,
+            full_html=True,
+            config=INTERACTION_CONFIG,
+        )
         self._temp_files.append(tmp.name)
         self.web_view.load(QUrl.fromLocalFile(tmp.name))
 
@@ -373,58 +449,70 @@ class Panel3D(QFrame):
         self.maximize_btn.setToolTip("Restore" if is_max else "Maximize")
 
 
-def _mesh_trace(volume: np.ndarray, level: float, step_size: int, color: str,
-                 opacity: float, name: str, spacing: tuple) -> Optional[go.Mesh3d]:
-    """Marching-cubes isosurface as a Plotly Mesh3d, or None if level is out
-    of range or the mesh comes out empty (e.g. an all-zero mask)."""
-    if not (volume.min() < level < volume.max()):
-        return None
-    try:
-        verts, faces, _, _ = marching_cubes(volume, level=level, step_size=step_size, spacing=spacing)
-    except (ValueError, RuntimeError):
-        return None
-    if len(faces) == 0:
-        return None
-    return go.Mesh3d(
-        x=verts[:, 0], y=verts[:, 1], z=verts[:, 2],
-        i=faces[:, 0], j=faces[:, 1], k=faces[:, 2],
-        color=color, opacity=opacity, name=name,
-        lighting=dict(ambient=0.55, diffuse=0.8, specular=0.12, roughness=0.85),
+def _style_ui_figure(fig: go.Figure) -> go.Figure:
+    """Strip notebook chrome so the mesh fills the dark Qt panel."""
+    fig.update_layout(
+        title=None,
+        width=None,
+        height=None,
+        margin=dict(l=0, r=0, t=0, b=0),
+        paper_bgcolor=BG_PANEL,
+        plot_bgcolor=BG_PANEL,
+        scene_bgcolor=BG_PANEL,
+        showlegend=False,
+        font=dict(color=TEXT_LIGHT),
     )
+    return fig
+
+
+def _prepare_3d(volume: np.ndarray, mask: Optional[np.ndarray], affine: np.ndarray):
+    """Downsample for marching cubes and convert the affine into voxel spacing."""
+    spacing = np.sqrt((affine[:3, :3] ** 2).sum(axis=0)).astype(np.float64)
+    longest = float(max(volume.shape))
+    factor = min(1.0, RENDER_MAX_DIM / longest) if longest else 1.0
+    if factor < 0.99:
+        new_shape = tuple(max(8, int(round(size * factor))) for size in volume.shape)
+        zooms = [new / old for new, old in zip(new_shape, volume.shape)]
+        volume = zoom(volume, zooms, order=1)
+        if mask is not None:
+            mask = (zoom(mask.astype(np.float32), zooms, order=0) > 0.5).astype(np.float32)
+        spacing = spacing / factor
+    return volume, mask, tuple(float(s) for s in spacing)
 
 
 def build_tumor_figure(mask: np.ndarray, spacing: tuple) -> go.Figure:
-    """Tumor mesh alone, for the small '3D tumor' panel."""
-    trace = _mesh_trace(mask.astype(np.float32), 0.5, step_size=1,
-                         color="rgb(216, 90, 48)", opacity=1.0, name="tumor", spacing=spacing)
-    fig = go.Figure(data=[trace] if trace else [])
-    fig.update_layout(
-        scene=dict(aspectmode="data", xaxis_visible=False, yaxis_visible=False, zaxis_visible=False),
-        margin=dict(l=0, r=0, t=0, b=0), showlegend=False,
+    """Tumor mesh alone, from the shared 3D viewer."""
+    fig = show_volume_3d(
+        mask,
+        mask,
+        show_brain=False,
+        level=0.5,
+        min_voxels=25,
+        spacing=spacing,
+        title="3D tumor",
+        clean=True,
+        show_legend=False,
     )
-    return fig
+    return _style_ui_figure(fig)
 
 
-def build_brain_figure(volume: np.ndarray, mask: np.ndarray, spacing: tuple) -> go.Figure:
-    """Semi-transparent brain shell with the tumor mesh visible inside it,
-    for the larger '3D brain view' panel."""
-    smoothed = gaussian_filter(volume, sigma=1.0)
-    brain_level = float(threshold_otsu(volume))
-    brain = _mesh_trace(smoothed, brain_level, step_size=2,
-                         color="rgb(188, 190, 200)", opacity=0.18, name="brain", spacing=spacing)
-    tumor = _mesh_trace(mask.astype(np.float32), 0.5, step_size=1,
-                         color="rgb(216, 90, 48)", opacity=1.0, name="tumor", spacing=spacing)
-
-    traces = [t for t in (brain, tumor) if t is not None]
-    fig = go.Figure(data=traces)
-    fig.update_layout(
-        scene=dict(
-            aspectmode="data", xaxis_visible=False, yaxis_visible=False, zaxis_visible=False,
-            camera=dict(eye=dict(x=1.55, y=-1.55, z=0.95), up=dict(x=0, y=0, z=1)),
-        ),
-        margin=dict(l=0, r=0, t=0, b=0), showlegend=False,
+def build_brain_figure(
+    volume: np.ndarray,
+    mask: Optional[np.ndarray],
+    spacing: tuple,
+) -> go.Figure:
+    """Brain shell, with the tumor inside it when a mask is available."""
+    fig = show_volume_3d(
+        volume,
+        mask,
+        show_brain=True,
+        min_voxels=25 if mask is not None else 1,
+        spacing=spacing,
+        title="3D brain",
+        clean=True,
+        show_legend=False,
     )
-    return fig
+    return _style_ui_figure(fig)
 
 
 class MainWindow(QMainWindow):
@@ -458,6 +546,15 @@ class MainWindow(QMainWindow):
         # segmentation" so picking a patient folder once is enough for both.
         self.current_folder: Optional[Path] = None
         self._nii_files: list = []
+        self._display_volume: Optional[np.ndarray] = None
+        self._display_affine: Optional[np.ndarray] = None
+        self._model = None
+        self._device = None
+        self._survival_stats = load_survival_stats()
+        try:
+            self._survival_table = load_survival_days()
+        except (FileNotFoundError, KeyError):
+            self._survival_table = {}
 
         central = QWidget()
 
@@ -510,7 +607,7 @@ class MainWindow(QMainWindow):
         self.status_label.setStyleSheet(f"font-size: 11px; color: {TEXT_MUTED};")
         left.addWidget(self.status_label)
 
-        self.patients_record_panel = PanelBox("Patients record", min_height=150)
+        self.patients_record_panel = PatientRecordPanel(min_height=150)
         left.addWidget(self.patients_record_panel)
         left.addStretch()
 
@@ -648,7 +745,9 @@ class MainWindow(QMainWindow):
         QApplication.processEvents()  # let the UI repaint before the model blocks
 
         try:
-            mask = self._run_model(model, model_input, target_shape=display_volume.shape)
+            mask, predicted_days = self._run_model(
+                model, model_input, target_shape=display_volume.shape
+            )
         except Exception as exc:
             self.busy_bar.hide()
             QMessageBox.critical(self, "Inference failed", str(exc))
@@ -665,31 +764,28 @@ class MainWindow(QMainWindow):
         voxel_vol_cm3 = self._voxel_volume_cm3(affine)
         tumor_cm3 = float(mask.sum()) * voxel_vol_cm3
         self.status_label.setText(f"Tumor volume: {tumor_cm3:.2f} cm\u00b3")
+        self.patients_record_panel.set_predictions(predicted_days, tumor_cm3)
 
         self._update_3d_views(display_volume, mask, affine)
         self.busy_bar.hide()
 
-    def _update_3d_views(self, display_volume: np.ndarray, mask: np.ndarray, affine: np.ndarray):
+    def _update_3d_views(
+        self,
+        display_volume: np.ndarray,
+        mask: Optional[np.ndarray],
+        affine: np.ndarray,
+    ):
         """
-        Builds the two 3D Plotly figures (tumor-only, and brain+tumor) and
-        loads them into the right-column panels. Runs synchronously on the
-        main thread — marching cubes on a full-resolution volume can take a
-        couple seconds, so the UI will briefly pause here. Fine for a single
-        case; if this becomes annoying, move it to a background thread like
-        the model inference eventually should be too.
+        Build the two 3D Plotly figures via `show_volume_3d` and load them
+        into the right-column panels. A None/empty mask still draws the brain.
         """
-        spacing = tuple(np.sqrt((affine[:3, :3] ** 2).sum(axis=0)))
-
-        if mask.sum() == 0:
-            self.status_label.setText(self.status_label.text() + "  (no tumor voxels — skipping 3D render)")
-            return
+        volume_3d, mask_3d, spacing = _prepare_3d(display_volume, mask, affine)
 
         try:
-            tumor_fig = build_tumor_figure(mask, spacing)
-            self.tumor_3d_panel.set_figure(tumor_fig)
-
-            brain_fig = build_brain_figure(display_volume, mask, spacing)
-            self.brain_3d_panel.set_figure(brain_fig)
+            has_tumor = mask_3d is not None and float(np.asarray(mask_3d).sum()) > 0
+            if has_tumor:
+                self.tumor_3d_panel.set_figure(build_tumor_figure(mask_3d, spacing))
+            self.brain_3d_panel.set_figure(build_brain_figure(volume_3d, mask_3d, spacing))
         except Exception as exc:
             QMessageBox.warning(self, "3D render failed", str(exc))
 
@@ -708,14 +804,15 @@ class MainWindow(QMainWindow):
         matching the MODALITIES list in your existing config.py)
         """
         tag_options = {
-            "t1": ["t1n", "t1"],
-            "t1ce": ["t1c", "t1ce"],
-            "t2": ["t2w", "t2"],
-            "flair": ["t2f", "flair"],
+            "t1c": ["t1c", "t1ce"],
+            "t1n": ["t1n", "t1"],
+            "t2f": ["t2f", "flair"],
+            "t2w": ["t2w", "t2"],
         }
         candidates = list(folder.glob("*.nii*"))
         found = {}
-        for key, tags in tag_options.items():
+        for key in MODALITIES:
+            tags = tag_options[key]
             match = None
             for tag in tags:
                 pattern = re.compile(rf"[_-]{tag}[_.]", re.IGNORECASE)
@@ -745,14 +842,14 @@ class MainWindow(QMainWindow):
         """
         arrays = {}
         affine = None
-        for key in ["t1", "t1ce", "t2", "flair"]:
+        for key in MODALITIES:
             img = nib.load(str(paths[key]))
             data = img.get_fdata().astype(np.float32)
-            if key == "flair":
+            if key == "t2f":
                 affine = img.affine
             arrays[key] = data
 
-        shape = arrays["flair"].shape
+        shape = arrays["t2f"].shape
         for key, arr in arrays.items():
             if arr.shape != shape:
                 raise ValueError(
@@ -761,19 +858,13 @@ class MainWindow(QMainWindow):
                 )
 
         # Display volume: normalized FLAIR, 0-1 range
-        flair = arrays["flair"]
+        flair = arrays["t2f"]
         d_min, d_max = float(flair.min()), float(flair.max())
         display_volume = (flair - d_min) / (d_max - d_min) if d_max > d_min else flair
 
-        # Model input: z-score each modality over its non-zero voxels, stack as channels
-        channels = []
-        for key in ["t1", "t1ce", "t2", "flair"]:
-            arr = arrays[key]
-            nonzero = arr[arr > 0]
-            mean = float(nonzero.mean()) if nonzero.size else 0.0
-            std = float(nonzero.std()) if nonzero.size else 1.0
-            channels.append((arr - mean) / (std + 1e-8))
-
+        # Same per-volume z-score the training dataset uses, stacked in the
+        # same channel order as config.MODALITIES.
+        channels = [_normalize(arrays[key]) for key in MODALITIES]
         stacked = np.stack(channels, axis=0)  # [4, D, H, W]
         tensor = torch.from_numpy(stacked).unsqueeze(0).float()  # [1, 4, D, H, W]
         return display_volume, tensor, affine
@@ -785,51 +876,58 @@ class MainWindow(QMainWindow):
         if not MODEL_PATH.exists():
             raise FileNotFoundError(f"Checkpoint not found: {MODEL_PATH}")
 
-        from monai.networks.nets import UNet
-        from monai.networks.layers import Norm
-
-        model = UNet(
-            spatial_dims=3,
-            in_channels=4,
-            out_channels=1,
-            channels=(32, 64, 128, 256, 320),
-            strides=(2, 2, 2, 2),
-            num_res_units=2,
-            norm=Norm.INSTANCE,
-        )
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         state_dict = torch.load(MODEL_PATH, map_location=device)
-        model.load_state_dict(state_dict)
+
+        model = MultiTaskUNet3D(in_channels=4, out_channels=1)
+        try:
+            model.load_state_dict(state_dict)
+        except RuntimeError:
+            model.load_segmentation_weights(state_dict)
+
         model.to(device)
         model.eval()
         self._model = model
         self._device = device
+        if self._survival_stats is None:
+            self._survival_stats = load_survival_stats()
         return model
 
-    def _run_model(self, model, model_input: torch.Tensor, target_shape: tuple) -> np.ndarray:
+    def _run_model(self, model, model_input: torch.Tensor, target_shape: tuple):
         """
-        Resizes the input to INFERENCE_SIZE, runs the model, upsamples the
-        sigmoid probability map back to target_shape with trilinear
-        interpolation (smoother than nearest for a probability field), then
-        thresholds at 0.5 to get the final binary mask at native resolution.
+        Resize the input to INFERENCE_SIZE, run both heads, upsample the
+        probability map back to native resolution, and return (mask, days).
         """
         device = self._device
         x = model_input.to(device)
-        native_shape = x.shape[2:]
 
         resized = torch.nn.functional.interpolate(
             x, size=INFERENCE_SIZE, mode="trilinear", align_corners=False
         )
 
         with torch.no_grad():
-            logits = model(resized)
+            outputs = run_model(model, resized)
+            logits, _ = split_model_outputs(outputs)
             probs = torch.sigmoid(logits)
 
         probs_native = torch.nn.functional.interpolate(
             probs, size=target_shape, mode="trilinear", align_corners=False
         )
         mask = (probs_native > 0.5).float().squeeze(0).squeeze(0).cpu().numpy()
-        return mask
+
+        predicted_days = None
+        if self._survival_stats is not None:
+            try:
+                predicted_days = predict_survival_days(
+                    model,
+                    resized.squeeze(0),
+                    device,
+                    self._survival_stats,
+                )
+            except AttributeError:
+                predicted_days = None
+
+        return mask, predicted_days
 
     @staticmethod
     def _voxel_volume_cm3(affine: np.ndarray) -> float:
@@ -863,6 +961,10 @@ class MainWindow(QMainWindow):
 
         self.current_folder = folder_path
         self._nii_files = nii_files
+        case_id = folder_path.name
+        self.patients_record_panel.set_case(
+            case_id, self._survival_table.get(case_id)
+        )
 
         self.file_selector.blockSignals(True)
         self.file_selector.clear()
@@ -889,7 +991,7 @@ class MainWindow(QMainWindow):
 
     def _load_and_display(self, path: Path):
         try:
-            volume = self._load_volume(str(path))
+            volume, affine = self._load_volume(str(path))
         except Exception as exc:
             QMessageBox.critical(self, "Failed to load volume", str(exc))
             return
@@ -897,13 +999,15 @@ class MainWindow(QMainWindow):
         self.sagittal_panel.set_volume(volume)
         self.axial_panel.set_volume(volume)
         self.coronal_panel.set_volume(volume)
+        self._display_volume = volume
+        self._display_affine = affine
+        self._update_3d_views(volume, None, affine)
 
     @staticmethod
-    def _load_volume(path: str) -> np.ndarray:
+    def _load_volume(path: str):
         """
         Loads a NIfTI file and returns a normalized 3D numpy array ready for
-        display (values roughly 0-1, so matplotlib's default grayscale scale
-        looks sensible regardless of the raw MRI intensity range).
+        display (values roughly 0-1) plus the affine for 3D voxel spacing.
         """
         img = nib.load(path)
         data = img.get_fdata()
@@ -919,7 +1023,7 @@ class MainWindow(QMainWindow):
         d_min, d_max = float(data.min()), float(data.max())
         if d_max > d_min:
             data = (data - d_min) / (d_max - d_min)
-        return data
+        return data, img.affine
 
 
 def main():

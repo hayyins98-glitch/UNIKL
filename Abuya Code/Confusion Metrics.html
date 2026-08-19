@@ -1,0 +1,832 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>BraTS-PEDs — Voxel Confusion Metrics (TP / TN / FP / FN)</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Sora:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
+  <style>
+    :root {
+      --bg: #f0f6fc;
+      --bg-deep: #e4eef8;
+      --ink: #0f2744;
+      --muted: #5b7390;
+      --line: rgba(37, 99, 235, 0.14);
+      --surface: rgba(255, 255, 255, 0.86);
+      --blue: #1d6ef5;
+      --blue-deep: #0b3d91;
+      --tp: #059669;
+      --tn: #64748b;
+      --fp: #dc2626;
+      --fn: #d97706;
+      --gt: #38bdf8;
+      --pred: #ec4899;
+      --font: "Sora", sans-serif;
+      --mono: "JetBrains Mono", monospace;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      min-height: 100vh;
+      font-family: var(--font);
+      color: var(--ink);
+      background:
+        radial-gradient(900px 480px at 8% -5%, rgba(29, 110, 245, 0.14), transparent 55%),
+        radial-gradient(700px 420px at 95% 5%, rgba(5, 150, 105, 0.08), transparent 50%),
+        linear-gradient(180deg, #f5f9fd 0%, var(--bg) 40%, var(--bg-deep) 100%);
+    }
+
+    body::before {
+      content: "";
+      position: fixed;
+      inset: 0;
+      background-image:
+        linear-gradient(rgba(29, 110, 245, 0.04) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(29, 110, 245, 0.04) 1px, transparent 1px);
+      background-size: 44px 44px;
+      mask-image: radial-gradient(ellipse 85% 65% at 50% 10%, black 15%, transparent 72%);
+      pointer-events: none;
+      z-index: 0;
+    }
+
+    .page {
+      position: relative;
+      z-index: 1;
+      width: min(1100px, calc(100% - 2rem));
+      margin: 0 auto;
+      padding: 2.5rem 0 3.5rem;
+    }
+
+    header { margin-bottom: 1.75rem; animation: fadeUp 0.6s ease both; }
+
+    .eyebrow {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.5rem;
+      font-family: var(--mono);
+      font-size: 0.7rem;
+      font-weight: 500;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      color: var(--blue);
+      margin-bottom: 0.75rem;
+    }
+
+    .eyebrow .dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--blue);
+      box-shadow: 0 0 0 0 rgba(29, 110, 245, 0.45);
+      animation: pulse 2s ease-out infinite;
+    }
+
+    h1 {
+      font-size: clamp(1.7rem, 4vw, 2.5rem);
+      font-weight: 800;
+      letter-spacing: -0.035em;
+      line-height: 1.15;
+      color: var(--blue-deep);
+    }
+
+    h1 em { font-style: normal; color: var(--blue); }
+
+    .lede {
+      margin-top: 0.75rem;
+      max-width: 68ch;
+      color: var(--muted);
+      font-size: 1rem;
+      line-height: 1.55;
+    }
+
+    .stat-row {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 0.65rem;
+      margin-top: 1.25rem;
+    }
+
+    .stat {
+      border: 1px solid var(--line);
+      background: var(--surface);
+      padding: 0.85rem 0.95rem;
+    }
+
+    .stat .k {
+      font-family: var(--mono);
+      font-size: 0.65rem;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--muted);
+    }
+
+    .stat .v {
+      margin-top: 0.2rem;
+      font-size: 1.25rem;
+      font-weight: 800;
+      color: var(--blue-deep);
+      letter-spacing: -0.03em;
+    }
+
+    .stat .f { margin-top: 0.15rem; font-size: 0.72rem; color: var(--muted); }
+
+    .panel {
+      background: var(--surface);
+      border: 1px solid var(--line);
+      backdrop-filter: blur(12px);
+      padding: 1.35rem 1.4rem 1.5rem;
+      margin-bottom: 1.15rem;
+      animation: fadeUp 0.65s ease both;
+    }
+
+    .panel h2 {
+      font-size: 1.1rem;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      color: var(--blue-deep);
+      margin-bottom: 0.35rem;
+    }
+
+    .panel .sub {
+      font-size: 0.88rem;
+      color: var(--muted);
+      line-height: 1.45;
+      margin-bottom: 1.15rem;
+    }
+
+    .cm-layout {
+      display: grid;
+      grid-template-columns: 1.15fr 1fr;
+      gap: 1.35rem;
+      align-items: start;
+    }
+
+    .sample-table-wrap {
+      border: 1px solid var(--line);
+      background: #fff;
+      overflow: auto;
+      max-height: 520px;
+    }
+
+    .cap {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 0.5rem;
+      padding: 0.65rem 0.85rem;
+      border-bottom: 1px solid var(--line);
+      background: rgba(29, 110, 245, 0.04);
+    }
+
+    .cap strong { font-size: 0.9rem; color: var(--blue-deep); }
+    .cap span {
+      font-family: var(--mono);
+      font-size: 0.65rem;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      color: var(--muted);
+    }
+
+    table.sample { width: 100%; border-collapse: collapse; font-size: 0.84rem; }
+
+    table.sample th {
+      font-family: var(--mono);
+      font-size: 0.65rem;
+      font-weight: 600;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      color: var(--muted);
+      text-align: left;
+      padding: 0.55rem 0.7rem;
+      border-bottom: 1px solid var(--line);
+      background: rgba(240, 246, 252, 0.95);
+      position: sticky;
+      top: 0;
+    }
+
+    table.sample td {
+      padding: 0.45rem 0.7rem;
+      border-bottom: 1px solid rgba(37, 99, 235, 0.08);
+      vertical-align: middle;
+    }
+
+    table.sample .id {
+      font-family: var(--mono);
+      font-size: 0.72rem;
+      font-weight: 500;
+      color: var(--blue-deep);
+    }
+
+    .pill {
+      display: inline-block;
+      font-family: var(--mono);
+      font-size: 0.68rem;
+      font-weight: 600;
+      letter-spacing: 0.03em;
+      padding: 0.18rem 0.45rem;
+      border: 1px solid var(--line);
+    }
+
+    .pill.short { color: #be123c; background: rgba(220, 38, 38, 0.08); border-color: rgba(220, 38, 38, 0.22); }
+    .pill.mid { color: #1d4ed8; background: rgba(29, 110, 245, 0.08); border-color: rgba(29, 110, 245, 0.22); }
+    .pill.long { color: #0f766e; background: rgba(13, 148, 136, 0.08); border-color: rgba(13, 148, 136, 0.22); }
+    .pill.none { color: #64748b; background: rgba(100, 116, 139, 0.08); border-color: rgba(100, 116, 139, 0.22); }
+
+    .matrix {
+      display: grid;
+      grid-template-columns: 90px 1fr 1fr;
+      gap: 0.45rem;
+    }
+
+    .matrix .corner, .matrix .col-h, .matrix .row-h {
+      font-family: var(--mono);
+      font-size: 0.68rem;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      color: var(--muted);
+      display: grid;
+      place-items: center;
+      text-align: center;
+      line-height: 1.3;
+    }
+
+    .matrix .col-h strong, .matrix .row-h strong {
+      display: block;
+      color: var(--blue-deep);
+      font-size: 0.78rem;
+      margin-top: 0.15rem;
+      text-transform: none;
+      letter-spacing: 0;
+    }
+
+    .cell {
+      border: 1px solid var(--line);
+      padding: 0.85rem 0.55rem;
+      text-align: center;
+      min-height: 96px;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      gap: 0.2rem;
+    }
+
+    .cell .label {
+      font-family: var(--mono);
+      font-size: 0.72rem;
+      font-weight: 600;
+      letter-spacing: 0.06em;
+    }
+
+    .cell .count {
+      font-size: 1.2rem;
+      font-weight: 800;
+      letter-spacing: -0.03em;
+      line-height: 1.1;
+    }
+
+    .cell .hint { font-size: 0.68rem; color: var(--muted); line-height: 1.3; }
+
+    .cell.tp { background: rgba(5, 150, 105, 0.12); border-color: rgba(5, 150, 105, 0.28); }
+    .cell.tp .label, .cell.tp .count { color: var(--tp); }
+    .cell.tn { background: rgba(100, 116, 139, 0.1); border-color: rgba(100, 116, 139, 0.28); }
+    .cell.tn .label, .cell.tn .count { color: var(--tn); }
+    .cell.fp { background: rgba(220, 38, 38, 0.1); border-color: rgba(220, 38, 38, 0.28); }
+    .cell.fp .label, .cell.fp .count { color: var(--fp); }
+    .cell.fn { background: rgba(217, 119, 6, 0.1); border-color: rgba(217, 119, 6, 0.28); }
+    .cell.fn .label, .cell.fn .count { color: var(--fn); }
+
+    .metrics {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 0.65rem;
+      margin-top: 0.85rem;
+    }
+
+    .metric {
+      border: 1px solid var(--line);
+      background: rgba(255, 255, 255, 0.7);
+      padding: 0.85rem 0.9rem;
+    }
+
+    .metric .k {
+      font-family: var(--mono);
+      font-size: 0.68rem;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--muted);
+    }
+
+    .metric .v {
+      margin-top: 0.25rem;
+      font-size: 1.35rem;
+      font-weight: 800;
+      color: var(--blue-deep);
+      letter-spacing: -0.03em;
+    }
+
+    .metric .f { margin-top: 0.2rem; font-size: 0.72rem; color: var(--muted); font-family: var(--mono); }
+    .metric.warn .v { color: var(--fn); }
+
+    .callout {
+      margin-top: 0.85rem;
+      padding: 0.8rem 0.9rem;
+      border: 1px solid rgba(217, 119, 6, 0.28);
+      background: rgba(217, 119, 6, 0.08);
+      font-size: 0.84rem;
+      line-height: 1.45;
+      color: var(--ink);
+    }
+
+    .mask-pair {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 0.85rem;
+      margin-bottom: 1rem;
+    }
+
+    .mask-card, .overlay-wrap {
+      border: 1px solid var(--line);
+      background: #fff;
+      overflow: hidden;
+      margin-bottom: 1rem;
+    }
+
+    .mask-card svg, .overlay-stage svg { display: block; width: 100%; height: auto; }
+
+    .overlay-stage {
+      position: relative;
+      width: 100%;
+      aspect-ratio: 16 / 10;
+      background: #1a2332;
+    }
+
+    .overlay-stage svg { position: absolute; inset: 0; width: 100%; height: 100%; }
+
+    .legend { display: flex; flex-wrap: wrap; gap: 0.55rem; margin-top: 1rem; }
+
+    .chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.4rem;
+      font-family: var(--mono);
+      font-size: 0.72rem;
+      font-weight: 500;
+      padding: 0.35rem 0.6rem;
+      border: 1px solid var(--line);
+      background: #fff;
+    }
+
+    .chip i { width: 10px; height: 10px; display: block; }
+    .chip.tp i { background: var(--tp); }
+    .chip.tn i { background: var(--tn); }
+    .chip.fp i { background: var(--fp); }
+    .chip.fn i { background: var(--fn); }
+    .chip.gt i { background: rgba(56, 189, 248, 0.75); box-shadow: inset 0 0 0 1px #38bdf8; }
+    .chip.pred i { background: rgba(236, 72, 153, 0.75); box-shadow: inset 0 0 0 1px #f472b6; }
+
+    .defs {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 0.65rem;
+      margin-top: 1.1rem;
+    }
+
+    .def {
+      border: 1px solid var(--line);
+      padding: 0.8rem 0.9rem;
+      background: rgba(255, 255, 255, 0.65);
+    }
+
+    .def h3 {
+      font-family: var(--mono);
+      font-size: 0.78rem;
+      font-weight: 600;
+      letter-spacing: 0.04em;
+      margin-bottom: 0.3rem;
+    }
+
+    .def.tp h3 { color: var(--tp); }
+    .def.tn h3 { color: var(--tn); }
+    .def.fp h3 { color: var(--fp); }
+    .def.fn h3 { color: var(--fn); }
+    .def p { font-size: 0.84rem; line-height: 1.45; color: var(--muted); }
+
+    footer {
+      margin-top: 1.5rem;
+      padding-top: 1rem;
+      border-top: 1px solid var(--line);
+      font-family: var(--mono);
+      font-size: 0.7rem;
+      color: var(--muted);
+      letter-spacing: 0.04em;
+    }
+
+    @keyframes fadeUp {
+      from { opacity: 0; transform: translateY(14px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+
+    @keyframes pulse {
+      0% { box-shadow: 0 0 0 0 rgba(29, 110, 245, 0.45); }
+      70% { box-shadow: 0 0 0 10px rgba(29, 110, 245, 0); }
+      100% { box-shadow: 0 0 0 0 rgba(29, 110, 245, 0); }
+    }
+
+    @media (max-width: 900px) {
+      .cm-layout, .defs, .metrics, .stat-row, .mask-pair { grid-template-columns: 1fr; }
+      .sample-table-wrap { max-height: 360px; }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { animation: none !important; transition: none !important; }
+    }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <header>
+      <div class="eyebrow">
+        <span class="dot" aria-hidden="true"></span>
+        Educational Visual · BraTS-PEDs v1
+      </div>
+      <h1>Tumor vs Background <em>Confusion Metrics</em></h1>
+      <p class="lede">
+        Confusion is computed <strong>per voxel</strong>:
+        whole-tumor (seg labels 1, 2, or 4) versus healthy tissue / background.
+        A second head on the same 3D U-Net also regresses overall survival in days.
+      </p>
+      <div class="stat-row">
+        <div class="stat">
+          <div class="k">Training cases</div>
+          <div class="v">257</div>
+          <div class="f">with segmentation masks</div>
+        </div>
+        <div class="stat">
+          <div class="k">Validation cases</div>
+          <div class="v">91</div>
+          <div class="f">no official GT masks</div>
+        </div>
+        <div class="stat">
+          <div class="k">Survival labels</div>
+          <div class="v">115</div>
+          <div class="f">of 457 metadata rows</div>
+        </div>
+        <div class="stat">
+          <div class="k">Survival (days)</div>
+          <div class="v">397</div>
+          <div class="f">median · range 10–5,274</div>
+        </div>
+      </div>
+    </header>
+
+    <section class="panel" aria-labelledby="cohort-title">
+      <h2 id="cohort-title">20 real cases from Training</h2>
+      <p class="sub">
+        IDs and survival come from <code>BraTS-PEDs_metadata(Survival rate).tsv</code>
+        (<code>BraTS-SubjectID</code> and <code>Overall survival (days)</code> only).
+        <strong>Ground truth</strong> is whole-tumor voxel count from each case’s <code>-seg.nii.gz</code>.
+        <strong>Predicted</strong> is the same educational overlay used in the figures (slight dilation plus a 12% miss), in voxels.
+        Short / typical / long is split on the cohort median of <strong>397 days</strong>.
+      </p>
+
+      <div class="sample-table-wrap">
+        <div class="cap">
+          <strong>Sample table (n = 20, real IDs)</strong>
+          <span>GT / Pred in voxels</span>
+        </div>
+        <table class="sample">
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>Case ID</th>
+              <th>Overall survival</th>
+              <th>Ground truth</th>
+              <th>Predicted</th>
+              <th>Band vs median</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr><td>1</td><td class="id">BraTS-PED-00001-000</td><td>315 days</td><td>128,667</td><td>164,202</td><td><span class="pill short">Short</span></td></tr>
+            <tr><td>2</td><td class="id">BraTS-PED-00002-000</td><td>367 days</td><td>17,497</td><td>21,671</td><td><span class="pill short">Short</span></td></tr>
+            <tr><td>3</td><td class="id">BraTS-PED-00003-000</td><td>496 days</td><td>16,602</td><td>21,961</td><td><span class="pill mid">Typical</span></td></tr>
+            <tr><td>4</td><td class="id">BraTS-PED-00004-000</td><td>819 days</td><td>156,797</td><td>175,203</td><td><span class="pill long">Long</span></td></tr>
+            <tr><td>5</td><td class="id">BraTS-PED-00005-000</td><td>3,142 days</td><td>17,239</td><td>23,239</td><td><span class="pill long">Long</span></td></tr>
+            <tr><td>6</td><td class="id">BraTS-PED-00006-000</td><td>855 days</td><td>4,951</td><td>8,945</td><td><span class="pill long">Long</span></td></tr>
+            <tr><td>7</td><td class="id">BraTS-PED-00008-000</td><td>100 days</td><td>84,225</td><td>105,350</td><td><span class="pill short">Short</span></td></tr>
+            <tr><td>8</td><td class="id">BraTS-PED-00009-000</td><td>1,747 days</td><td>109,723</td><td>127,835</td><td><span class="pill long">Long</span></td></tr>
+            <tr><td>9</td><td class="id">BraTS-PED-00010-000</td><td>1,492 days</td><td>99,608</td><td>114,052</td><td><span class="pill long">Long</span></td></tr>
+            <tr><td>10</td><td class="id">BraTS-PED-00013-000</td><td>456 days</td><td>76,851</td><td>87,504</td><td><span class="pill mid">Typical</span></td></tr>
+            <tr><td>11</td><td class="id">BraTS-PED-00014-000</td><td>527 days</td><td>43,280</td><td>53,100</td><td><span class="pill mid">Typical</span></td></tr>
+            <tr><td>12</td><td class="id">BraTS-PED-00015-000</td><td>132 days</td><td>32,906</td><td>42,689</td><td><span class="pill short">Short</span></td></tr>
+            <tr><td>13</td><td class="id">BraTS-PED-00016-000</td><td>478 days</td><td>63,405</td><td>73,876</td><td><span class="pill mid">Typical</span></td></tr>
+            <tr><td>14</td><td class="id">BraTS-PED-00017-000</td><td>—</td><td>73,167</td><td>88,385</td><td><span class="pill none">Unlabeled</span></td></tr>
+            <tr><td>15</td><td class="id">BraTS-PED-00018-000</td><td>2,561 days</td><td>154,673</td><td>170,420</td><td><span class="pill long">Long</span></td></tr>
+            <tr><td>16</td><td class="id">BraTS-PED-00019-000</td><td>772 days</td><td>168,933</td><td>194,179</td><td><span class="pill long">Long</span></td></tr>
+            <tr><td>17</td><td class="id">BraTS-PED-00020-000</td><td>328 days</td><td>57,803</td><td>65,200</td><td><span class="pill short">Short</span></td></tr>
+            <tr><td>18</td><td class="id">BraTS-PED-00021-000</td><td>575 days</td><td>198,327</td><td>223,036</td><td><span class="pill mid">Typical</span></td></tr>
+            <tr><td>19</td><td class="id">BraTS-PED-00022-000</td><td>637 days</td><td>79,016</td><td>89,222</td><td><span class="pill mid">Typical</span></td></tr>
+            <tr><td>20</td><td class="id">BraTS-PED-00024-000</td><td>630 days</td><td>18,842</td><td>30,679</td><td><span class="pill mid">Typical</span></td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="panel" aria-labelledby="cm-title">
+      <h2 id="cm-title">Voxel confusion on BraTS-PED-00001-000</h2>
+      <p class="sub">
+        Native volume shape <strong>240 × 240 × 155</strong> = 8,928,000 voxels.
+        Ground truth is the official <code>-seg.nii.gz</code> (any label &gt; 0 = whole tumor, 128,667 voxels).
+        The “prediction” here is an educational overlay on that real mask (slight dilation plus a 12% miss),
+        so TP / FP / FN are visible — not a claim about the trained U-Net.
+      </p>
+
+      <div class="cm-layout">
+        <div class="matrix-wrap">
+          <div class="matrix" role="table" aria-label="Voxel confusion matrix">
+            <div class="corner"></div>
+            <div class="col-h">Predicted<br /><strong>Tumor (+)</strong></div>
+            <div class="col-h">Predicted<br /><strong>Background (−)</strong></div>
+
+            <div class="row-h">Actual<br /><strong>Tumor (+)</strong></div>
+            <div class="cell tp">
+              <span class="label">TP</span>
+              <span class="count">113,227</span>
+              <span class="hint">overlap</span>
+            </div>
+            <div class="cell fn">
+              <span class="label">FN</span>
+              <span class="count">15,440</span>
+              <span class="hint">missed tumor</span>
+            </div>
+
+            <div class="row-h">Actual<br /><strong>Background (−)</strong></div>
+            <div class="cell fp">
+              <span class="label">FP</span>
+              <span class="count">50,975</span>
+              <span class="hint">over-segmentation</span>
+            </div>
+            <div class="cell tn">
+              <span class="label">TN</span>
+              <span class="count">8,748,358</span>
+              <span class="hint">correct background</span>
+            </div>
+          </div>
+        </div>
+
+        <div>
+          <div class="metrics" aria-label="Derived voxel metrics">
+            <div class="metric warn">
+              <div class="k">Accuracy</div>
+              <div class="v">99.3%</div>
+              <div class="f">(TP+TN) / 8,928,000</div>
+            </div>
+            <div class="metric">
+              <div class="k">Precision</div>
+              <div class="v">69.0%</div>
+              <div class="f">TP / (TP+FP)</div>
+            </div>
+            <div class="metric">
+              <div class="k">Recall (Sensitivity)</div>
+              <div class="v">88.0%</div>
+              <div class="f">TP / (TP+FN)</div>
+            </div>
+            <div class="metric">
+              <div class="k">Specificity</div>
+              <div class="v">99.4%</div>
+              <div class="f">TN / (TN+FP)</div>
+            </div>
+            <div class="metric">
+              <div class="k">F1-Score</div>
+              <div class="v">77.3%</div>
+              <div class="f">2·P·R / (P+R)</div>
+            </div>
+            <div class="metric">
+              <div class="k">Dice</div>
+              <div class="v">77.3%</div>
+              <div class="f">2×TP / (2×TP+FP+FN)</div>
+            </div>
+          </div>
+          <div class="callout">
+            <strong>Why Dice, not accuracy?</strong> Almost every voxel is healthy brain,
+            so TN dominates and accuracy looks “perfect”. Dice ignores the empty space and
+            only scores overlap of the tumor — that is the metric the training loop tracks
+            (validation Dice 0.837 after two epochs on this project).
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel" aria-labelledby="masks-title">
+      <h2 id="masks-title">Ground truth and predicted masks</h2>
+      <p class="sub">
+        Left = official <strong>ground truth</strong> (<code>BraTS-PED-00001-000-seg.nii.gz</code>, whole-tumor).
+        Right = <strong>predicted</strong> mask (educational overlay: slightly larger than GT, plus a false-positive island).
+        Below, both are drawn on the same scan so the overlap is visible.
+      </p>
+
+      <div class="mask-pair">
+        <div class="mask-card">
+          <div class="cap">
+            <strong>Ground truth</strong>
+            <span>Blue · 128,667 tumor voxels</span>
+          </div>
+          <svg viewBox="0 0 800 420" role="img" aria-label="Ground truth tumor mask">
+            <defs>
+              <radialGradient id="tissueGt" cx="50%" cy="45%" r="65%">
+                <stop offset="0%" stop-color="#3d4f66" />
+                <stop offset="100%" stop-color="#1a2332" />
+              </radialGradient>
+            </defs>
+            <rect width="800" height="420" fill="url(#tissueGt)" />
+            <ellipse cx="400" cy="210" rx="210" ry="170" fill="#2a3a4f" opacity="0.55" />
+            <path d="M270 160 C330 105, 470 100, 530 165 C585 225, 570 305, 495 335 C420 365, 310 340, 275 275 C250 230, 240 190, 270 160 Z"
+                  fill="rgba(56, 189, 248, 0.50)"
+                  stroke="rgba(56, 189, 248, 0.95)"
+                  stroke-width="2.5" />
+            <text x="400" y="400" fill="#94a3b8" font-family="Sora,sans-serif" font-size="14" font-weight="600" text-anchor="middle">GT only — no predicted mask</text>
+          </svg>
+        </div>
+
+        <div class="mask-card">
+          <div class="cap">
+            <strong>Predicted</strong>
+            <span>Magenta · 164,202 tumor voxels</span>
+          </div>
+          <svg viewBox="0 0 800 420" role="img" aria-label="Predicted tumor mask">
+            <defs>
+              <radialGradient id="tissuePred" cx="50%" cy="45%" r="65%">
+                <stop offset="0%" stop-color="#3d4f66" />
+                <stop offset="100%" stop-color="#1a2332" />
+              </radialGradient>
+            </defs>
+            <rect width="800" height="420" fill="url(#tissuePred)" />
+            <ellipse cx="400" cy="210" rx="210" ry="170" fill="#2a3a4f" opacity="0.55" />
+            <path d="M330 170 C385 120, 500 115, 560 175 C620 235, 600 315, 520 345 C455 368, 360 345, 325 280 C305 240, 300 200, 330 170 Z"
+                  fill="rgba(236, 72, 153, 0.50)"
+                  stroke="rgba(244, 114, 182, 0.95)"
+                  stroke-width="2.5" />
+            <ellipse cx="620" cy="130" rx="52" ry="40"
+                     fill="rgba(236, 72, 153, 0.50)"
+                     stroke="rgba(244, 114, 182, 0.95)"
+                     stroke-width="2.5" />
+            <text x="400" y="400" fill="#94a3b8" font-family="Sora,sans-serif" font-size="14" font-weight="600" text-anchor="middle">Pred only — extra island is FP</text>
+          </svg>
+        </div>
+      </div>
+
+      <div class="mask-card">
+        <div class="cap">
+          <strong>Ground truth + predicted (overlaid)</strong>
+          <span>Blue = GT · Magenta = Pred · Blend = TP overlap</span>
+        </div>
+        <svg viewBox="0 0 800 420" role="img" aria-label="Overlapped ground truth and predicted tumor masks">
+          <defs>
+            <radialGradient id="tissue" cx="50%" cy="45%" r="65%">
+              <stop offset="0%" stop-color="#3d4f66" />
+              <stop offset="100%" stop-color="#1a2332" />
+            </radialGradient>
+          </defs>
+          <rect width="800" height="420" fill="url(#tissue)" />
+          <ellipse cx="400" cy="210" rx="210" ry="170" fill="#2a3a4f" opacity="0.55" />
+          <ellipse cx="150" cy="100" rx="70" ry="48" fill="#2a3a4f" opacity="0.5" />
+          <ellipse cx="660" cy="300" rx="90" ry="60" fill="#2a3a4f" opacity="0.4" />
+
+          <path d="M270 160 C330 105, 470 100, 530 165 C585 225, 570 305, 495 335 C420 365, 310 340, 275 275 C250 230, 240 190, 270 160 Z"
+                fill="rgba(56, 189, 248, 0.42)"
+                stroke="rgba(56, 189, 248, 0.95)"
+                stroke-width="2.5" />
+
+          <path d="M330 170 C385 120, 500 115, 560 175 C620 235, 600 315, 520 345 C455 368, 360 345, 325 280 C305 240, 300 200, 330 170 Z"
+                fill="rgba(236, 72, 153, 0.40)"
+                stroke="rgba(244, 114, 182, 0.95)"
+                stroke-width="2.5" />
+
+          <ellipse cx="620" cy="130" rx="52" ry="40"
+                   fill="rgba(236, 72, 153, 0.40)"
+                   stroke="rgba(244, 114, 182, 0.95)"
+                   stroke-width="2.5" />
+
+          <text x="400" y="245" fill="#ffffff" font-family="Sora,sans-serif" font-size="15" font-weight="700" text-anchor="middle" opacity="0.9">Overlap zone</text>
+        </svg>
+      </div>
+
+      <div class="legend">
+        <span class="chip gt"><i></i> Ground truth (translucent blue)</span>
+        <span class="chip pred"><i></i> Predicted (translucent magenta)</span>
+        <span class="chip tp"><i></i> True Positive</span>
+        <span class="chip tn"><i></i> True Negative</span>
+        <span class="chip fp"><i></i> False Positive</span>
+        <span class="chip fn"><i></i> False Negative</span>
+      </div>
+    </section>
+
+    <section class="panel" aria-labelledby="overlay-title">
+      <h2 id="overlay-title">Where is TP / TN / FP / FN?</h2>
+      <p class="sub">
+        Same overlapped translucent masks. Arrows point to each confusion category
+        on a pediatric brain slice — no extra colour highlighting on the regions.
+      </p>
+
+      <div class="overlay-wrap">
+        <div class="cap">
+          <strong>Ground Truth + Predicted</strong>
+          <span>Arrows label TP · TN · FP · FN</span>
+        </div>
+        <div class="overlay-stage">
+          <svg viewBox="0 0 800 500" role="img" aria-label="Overlapped tumor masks with arrows for TP TN FP FN">
+            <defs>
+              <radialGradient id="scanBg" cx="50%" cy="45%" r="70%">
+                <stop offset="0%" stop-color="#2c3b50" />
+                <stop offset="100%" stop-color="#151d29" />
+              </radialGradient>
+              <marker id="arrowTP" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+                <path d="M0,0 L6,3 L0,6 Z" fill="#34d399" />
+              </marker>
+              <marker id="arrowTN" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+                <path d="M0,0 L6,3 L0,6 Z" fill="#94a3b8" />
+              </marker>
+              <marker id="arrowFP" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+                <path d="M0,0 L6,3 L0,6 Z" fill="#f87171" />
+              </marker>
+              <marker id="arrowFN" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+                <path d="M0,0 L6,3 L0,6 Z" fill="#fbbf24" />
+              </marker>
+            </defs>
+
+            <rect width="800" height="500" fill="url(#scanBg)" />
+            <ellipse cx="400" cy="250" rx="230" ry="185" fill="#243244" opacity="0.55" />
+            <ellipse cx="160" cy="120" rx="70" ry="48" fill="#243244" opacity="0.55" />
+            <ellipse cx="640" cy="360" rx="90" ry="60" fill="#243244" opacity="0.45" />
+
+            <path d="M270 190 C320 140, 450 135, 505 195 C555 250, 540 330, 470 355 C400 380, 310 350, 285 290 C265 245, 250 215, 270 190 Z"
+                  fill="rgba(56, 189, 248, 0.42)"
+                  stroke="rgba(56, 189, 248, 0.95)"
+                  stroke-width="2.5" />
+
+            <path d="M340 200 C380 155, 470 145, 530 195 C580 245, 565 315, 500 340 C450 358, 380 340, 350 290 C330 255, 320 225, 340 200 Z"
+                  fill="rgba(236, 72, 153, 0.40)"
+                  stroke="rgba(244, 114, 182, 0.95)"
+                  stroke-width="2.5" />
+            <ellipse cx="600" cy="150" rx="48" ry="38"
+                     fill="rgba(236, 72, 153, 0.40)"
+                     stroke="rgba(244, 114, 182, 0.95)"
+                     stroke-width="2.5" />
+
+            <line x1="175" y1="75" x2="410" y2="250" stroke="#34d399" stroke-width="2.5" marker-end="url(#arrowTP)" />
+            <rect x="48" y="34" width="168" height="52" rx="4" fill="rgba(5, 46, 31, 0.88)" stroke="#34d399" stroke-width="1.5" />
+            <text x="132" y="55" fill="#6ee7b7" font-family="JetBrains Mono,monospace" font-size="13" font-weight="600" text-anchor="middle">TRUE POSITIVE</text>
+            <text x="132" y="73" fill="#a7f3d0" font-family="Sora,sans-serif" font-size="11" text-anchor="middle">Blue ∩ Magenta overlap</text>
+
+            <line x1="115" y1="230" x2="290" y2="230" stroke="#fbbf24" stroke-width="2.5" marker-end="url(#arrowFN)" />
+            <rect x="28" y="198" width="120" height="52" rx="4" fill="rgba(59, 37, 8, 0.88)" stroke="#fbbf24" stroke-width="1.5" />
+            <text x="88" y="219" fill="#fcd34d" font-family="JetBrains Mono,monospace" font-size="13" font-weight="600" text-anchor="middle">FALSE NEG</text>
+            <text x="88" y="237" fill="#fde68a" font-family="Sora,sans-serif" font-size="11" text-anchor="middle">Blue only (GT)</text>
+
+            <line x1="720" y1="90" x2="640" y2="140" stroke="#f87171" stroke-width="2.5" marker-end="url(#arrowFP)" />
+            <rect x="640" y="28" width="140" height="52" rx="4" fill="rgba(69, 10, 10, 0.88)" stroke="#f87171" stroke-width="1.5" />
+            <text x="710" y="49" fill="#fca5a5" font-family="JetBrains Mono,monospace" font-size="13" font-weight="600" text-anchor="middle">FALSE POS</text>
+            <text x="710" y="67" fill="#fecaca" font-family="Sora,sans-serif" font-size="11" text-anchor="middle">Magenta only</text>
+
+            <line x1="720" y1="290" x2="545" y2="255" stroke="#f87171" stroke-width="2.5" marker-end="url(#arrowFP)" />
+            <rect x="640" y="278" width="140" height="52" rx="4" fill="rgba(69, 10, 10, 0.88)" stroke="#f87171" stroke-width="1.5" />
+            <text x="710" y="299" fill="#fca5a5" font-family="JetBrains Mono,monospace" font-size="13" font-weight="600" text-anchor="middle">FALSE POS</text>
+            <text x="710" y="317" fill="#fecaca" font-family="Sora,sans-serif" font-size="11" text-anchor="middle">Magenta only</text>
+
+            <line x1="175" y1="450" x2="140" y2="360" stroke="#94a3b8" stroke-width="2.5" marker-end="url(#arrowTN)" />
+            <rect x="28" y="430" width="168" height="52" rx="4" fill="rgba(30, 41, 59, 0.88)" stroke="#94a3b8" stroke-width="1.5" />
+            <text x="112" y="451" fill="#cbd5e1" font-family="JetBrains Mono,monospace" font-size="13" font-weight="600" text-anchor="middle">TRUE NEGATIVE</text>
+            <text x="112" y="469" fill="#94a3b8" font-family="Sora,sans-serif" font-size="11" text-anchor="middle">Neither mask</text>
+          </svg>
+        </div>
+      </div>
+
+      <div class="defs">
+        <div class="def tp">
+          <h3>TP — True Positive</h3>
+          <p>Voxel is tumor in the ground-truth mask <strong>and</strong> the model also predicts tumor. Correct detection of the mass.</p>
+        </div>
+        <div class="def tn">
+          <h3>TN — True Negative</h3>
+          <p>Voxel is healthy / background in the ground truth <strong>and</strong> the model predicts non-tumor. Correct healthy tissue. This class is huge in 3D MRI.</p>
+        </div>
+        <div class="def fp">
+          <h3>FP — False Positive</h3>
+          <p>Model predicts tumor, but ground truth is background. Over-segmentation — the extra magenta blob, or the blue islands in the 3D viewer.</p>
+        </div>
+        <div class="def fn">
+          <h3>FN — False Negative</h3>
+          <p>Ground truth is tumor, but the model misses it. Under-segmentation — clinically the costly error, because part of the mass is left unmarked.</p>
+        </div>
+      </div>
+    </section>
+
+    <footer>
+      BraTS-PEDs v1 · 3D U-Net (segmentation + survival heads) · voxel confusion visual ·
+      survival from BraTS-PEDs_metadata (Survival rate).tsv · case BraTS-PED-00001-000 for the matrix counts
+    </footer>
+  </div>
+</body>
+</html>
