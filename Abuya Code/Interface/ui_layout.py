@@ -11,9 +11,11 @@ survival head), the Plotly 3D viewer, and the BraTS-PEDs survival metadata.
 Run from this folder or the project root:
     python ui_layout.py
 """
+import math
 import re
 import sys
 import tempfile
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -28,14 +30,15 @@ import nibabel as nib
 import torch
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
-from scipy.ndimage import zoom
+from scipy.ndimage import zoom, label as ndi_label, center_of_mass as ndi_center_of_mass
 import plotly.graph_objects as go
 
-from PySide6.QtCore import Qt, QUrl
+from PySide6.QtCore import Qt, QUrl, QTimer, QPointF
+from PySide6.QtGui import QPainter, QPen, QColor, QPixmap
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QFrame, QFileDialog, QSizePolicy, QSlider, QMessageBox,
-    QProgressBar, QComboBox,
+    QProgressBar, QComboBox, QStackedLayout,
 )
 from PySide6.QtWebEngineWidgets import QWebEngineView
 
@@ -46,7 +49,7 @@ from brain_tumor_seg.evaluation import predict_survival_days
 from brain_tumor_seg.models import MultiTaskUNet3D
 from brain_tumor_seg.models.multitask import run_model, split_model_outputs
 from brain_tumor_seg.visualization.survival import format_survival
-from brain_tumor_seg.visualization.viewer3d import INTERACTION_CONFIG, show_volume_3d
+from brain_tumor_seg.visualization.viewer3d import INTERACTION_CONFIG, show_volume_3d, brain_surface_level
 
 # ---------------------------------------------------------------------------
 # Dark theme palette
@@ -64,6 +67,28 @@ ACCENT_CORAL = "#ff9f0a"     # systemOrange — tumor-related accent (3D tumor p
 ACCENT_CORAL_SOFT = "#ffb340"
 TEXT_LIGHT = "#f2f2f7"       # label — primary text
 TEXT_MUTED = "#8e8e93"       # systemGray — secondary/muted text
+
+# Distinct colors assigned to separate tumor components (a brain can have
+# more than one lesion) — largest lesion gets the first color, and the
+# same color is used consistently across the 2D heatmap, the report
+# panel, and the PDF export so "the blue one" means the same tumor
+# everywhere. Cycles if there are more components than colors.
+COMPONENT_PALETTE = [
+    ("Red", "#ff3b30"),
+    ("Blue", "#0a84ff"),
+    ("Green", "#30d158"),
+    ("Yellow", "#ffd60a"),
+    ("Purple", "#bf5af2"),
+    ("Cyan", "#64d2ff"),
+    ("Orange", "#ff9f0a"),
+    ("Pink", "#ff375f"),
+]
+
+
+def _hex_to_rgb01(hex_color: str) -> tuple:
+    """'#ff3b30' -> (1.0, 0.23, 0.19), for blending into a matplotlib RGB array."""
+    h = hex_color.lstrip("#")
+    return (int(h[0:2], 16) / 255.0, int(h[2:4], 16) / 255.0, int(h[4:6], 16) / 255.0)
 
 # Single spacing unit used everywhere: gap between columns, gap between
 # panels within a column, gap between buttons, and the window's outer
@@ -84,9 +109,12 @@ QMessageBox {{
 QMessageBox QLabel {{
     color: {TEXT_LIGHT};
 }}
+QSlider {{
+    background: transparent;
+}}
 QSlider::groove:horizontal {{
     height: 4px;
-    background: {BORDER_DIM};
+    background: #000000;
     border-radius: 2px;
 }}
 QSlider::handle:horizontal {{
@@ -177,6 +205,41 @@ MODEL_PATH = _resolve_checkpoint()
 INFERENCE_SIZE = TARGET_SHAPE
 # 3D marching cubes on a native 240^3 volume stalls the UI; downsample first.
 RENDER_MAX_DIM = 96
+# Every loaded scan gets resampled to this shape before display, regardless
+# of its native resolution — different patients/scanners can have different
+# native voxel grids, and without this the 2D panels would show
+# inconsistent proportions from one case to the next.
+STANDARD_DISPLAY_SHAPE = (128, 128, 128)
+
+
+def _standardize_volume(volume: np.ndarray, affine: np.ndarray, order: int = 1):
+    """
+    Resamples `volume` to STANDARD_DISPLAY_SHAPE and returns a matching
+    diagonal affine reflecting the new (larger or smaller) voxel spacing,
+    so downstream physical measurements — report volumes, voxel-cm3 math,
+    3D mesh spacing — stay accurate after the resize rather than silently
+    assuming 1mm voxels.
+    """
+    native_spacing = np.sqrt((affine[:3, :3] ** 2).sum(axis=0))
+    old_shape = np.array(volume.shape, dtype=np.float64)
+    new_shape = np.array(STANDARD_DISPLAY_SHAPE, dtype=np.float64)
+    zoom_factors = new_shape / old_shape
+
+    resampled = zoom(volume, zoom_factors, order=order)
+    # zoom()'s output can be off by a voxel from rounding; crop/pad to the
+    # exact target shape so every panel gets a truly identical array size.
+    if resampled.shape != STANDARD_DISPLAY_SHAPE:
+        slices = tuple(slice(0, min(s, t)) for s, t in zip(resampled.shape, STANDARD_DISPLAY_SHAPE))
+        cropped = resampled[slices]
+        pad_widths = [(0, t - c) for c, t in zip(cropped.shape, STANDARD_DISPLAY_SHAPE)]
+        resampled = np.pad(cropped, pad_widths, mode="constant")
+
+    new_spacing = native_spacing * (old_shape / new_shape)
+    new_affine = np.eye(4)
+    new_affine[0, 0] = new_spacing[0]
+    new_affine[1, 1] = new_spacing[1]
+    new_affine[2, 2] = new_spacing[2]
+    return resampled, new_affine
 
 
 def _muted_label(text: str) -> QLabel:
@@ -259,6 +322,184 @@ class PatientRecordPanel(QFrame):
             self.volume_label.setText(f"{tumor_cm3:.2f} cm\u00b3")
 
 
+class PixelateEffect(QWidget):
+    """
+    Renders a pixelated/blocky version of a snapshot of the actual slice
+    image (not an abstract shape), with the block size animating between
+    fine and coarse over time — reads as 'the system is actively
+    processing this specific image' rather than a generic overlay.
+    """
+
+    def __init__(self, color: str = ACCENT_TEAL, parent=None):
+        super().__init__(parent)
+        self._tint = QColor(color)
+        self._source: Optional[QPixmap] = None
+        self._phase = 0.0
+        self._interval_ms = 60
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._advance)
+
+    def set_source(self, pixmap: QPixmap):
+        """Call this right before start() with a fresh grab() of the
+        canvas — the effect pixelates whatever was last actually shown."""
+        self._source = pixmap
+        self.update()
+
+    def start(self):
+        self._timer.start(self._interval_ms)
+
+    def stop(self):
+        self._timer.stop()
+        self._phase = 0.0
+
+    def _advance(self):
+        self._phase = (self._phase + 0.05) % (2 * math.pi)
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, False)  # crisp blocks, no smoothing
+
+        w, h = self.width(), self.height()
+        if self._source is None or self._source.isNull() or w <= 0 or h <= 0:
+            painter.end()
+            return
+
+        # Block size oscillates between fine and coarse pixelation —
+        # downscale-then-upscale with no smoothing is the classic
+        # pixelation trick.
+        wave = (math.sin(self._phase) + 1) / 2  # 0..1
+        block = max(2, int(4 + wave * 24))
+        small_w = max(1, w // block)
+        small_h = max(1, h // block)
+
+        scaled_down = self._source.scaled(
+            small_w, small_h, Qt.IgnoreAspectRatio, Qt.FastTransformation
+        )
+        pixelated = scaled_down.scaled(
+            w, h, Qt.IgnoreAspectRatio, Qt.FastTransformation
+        )
+
+        painter.setOpacity(0.9)
+        painter.drawPixmap(0, 0, pixelated)
+
+        # Faint accent tint so the pixelated frame reads as "processing,"
+        # not just a low-res copy of the image.
+        tint = QColor(self._tint)
+        tint.setAlphaF(0.12)
+        painter.setOpacity(1.0)
+        painter.fillRect(self.rect(), tint)
+
+        painter.end()
+
+
+class ScanLineSweep(QWidget):
+    """
+    A glowing horizontal line that sweeps top-to-bottom across the whole
+    panel on a loop, with a short fading trail behind it — a literal
+    'scanning the image' cue. Unlike the small fixed-size loaders before
+    this one, it stretches to fill whatever space it's given.
+    """
+
+    def __init__(self, color: str = ACCENT_TEAL, parent=None):
+        super().__init__(parent)
+        self._base_color = QColor(color)
+        self._progress = 0.0  # 0..1, position from top to bottom
+        self._interval_ms = 20
+        self._speed = 0.012  # progress added per tick
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._advance)
+
+    def start(self):
+        self._timer.start(self._interval_ms)
+
+    def stop(self):
+        self._timer.stop()
+        self._progress = 0.0
+
+    def _advance(self):
+        self._progress = (self._progress + self._speed) % 1.0
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+
+        w, h = self.width(), self.height()
+        y = self._progress * h
+
+        # Main line plus a few fainter copies trailing behind it, standing
+        # in for a soft glow/motion-blur without needing a real blur effect.
+        trail = [(0, 1.0, 3.0), (9, 0.5, 2.2), (18, 0.25, 1.6), (28, 0.1, 1.0)]
+        for offset, opacity, pen_width in trail:
+            trail_y = y - offset
+            if trail_y < 0:
+                continue
+            color = QColor(self._base_color)
+            color.setAlphaF(opacity)
+            painter.setPen(QPen(color, pen_width))
+            painter.drawLine(QPointF(0, trail_y), QPointF(w, trail_y))
+
+        painter.end()
+
+
+class ArcSpinner(QWidget):
+    """
+    Small segmented rotating arc — the secondary 'processing' cue paired
+    with the scan line sweep above, meant to sit tucked in a corner
+    rather than as the main focal point.
+    """
+
+    def __init__(self, diameter: int = 26, color: str = ACCENT_TEAL, parent=None):
+        super().__init__(parent)
+        self._base_color = QColor(color)
+        self._angle = 0.0
+        self.setFixedSize(diameter, diameter)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._advance)
+
+        self._segments = [
+            (0, 60, 1.00),
+            (75, 40, 0.60),
+            (130, 25, 0.30),
+        ]
+
+    def start(self):
+        self._timer.start(16)
+
+    def stop(self):
+        self._timer.stop()
+
+    def _advance(self):
+        self._angle = (self._angle + 8) % 360
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+
+        rect = self.rect().adjusted(3, 3, -3, -3)
+        pen_width = 2.5
+
+        for offset, span, opacity in self._segments:
+            color = QColor(self._base_color)
+            color.setAlphaF(opacity)
+            painter.setPen(QPen(color, pen_width, Qt.SolidLine, Qt.RoundCap))
+            start_angle = int((self._angle + offset) * 16)
+            span_angle = int(span * 16)
+            painter.drawArc(rect, start_angle, span_angle)
+
+        painter.end()
+
+
 class SlicePanel(QFrame):
     """
     A bordered panel that shows one anatomical plane of a 3D volume as a
@@ -272,11 +513,22 @@ class SlicePanel(QFrame):
     def __init__(self, title: str, axis: int, min_height: int = 200):
         super().__init__()
         self.axis = axis
-        self.volume = None   # grayscale background, 3D numpy array, 0-1 range
-        self.mask = None     # optional binary mask, same shape as volume
+        self.volume = None      # grayscale background, 3D numpy array, 0-1 range
+        self.mask = None        # optional binary mask, same shape as volume
+        self.probs = None       # optional continuous 0-1 probability map, same shape
+        self.labels = None      # optional int array, same shape: 0=background, 1..N=component id
+        self.color_map = None   # optional {component_id: hex_color}, matching self.labels
 
         self.setFrameShape(QFrame.Box)
-        self.setStyleSheet(_panel_style())
+        # Pure black background (not the charcoal BG_PANEL used elsewhere)
+        # — MRI slices have their own black background outside the brain,
+        # so matching that exactly makes the panel disappear into the
+        # image instead of showing as a separate charcoal-colored frame
+        # around it.
+        self.setStyleSheet(
+            "QFrame { border: 1.5px solid #000000; border-radius: 16px; "
+            "background-color: #000000; }"
+        )
         self.setMinimumHeight(min_height)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
@@ -301,14 +553,72 @@ class SlicePanel(QFrame):
         layout.addLayout(header)
 
         self.figure = Figure(figsize=(3, 3))
-        self.figure.patch.set_facecolor(BG_PANEL)
+        self.figure.patch.set_facecolor("#000000")
         self.figure.subplots_adjust(left=0, right=1, top=1, bottom=0)
         self.canvas = FigureCanvasQTAgg(self.figure)
-        self.canvas.setStyleSheet(f"background-color: {BG_PANEL};")
+        self.canvas.setStyleSheet("background-color: #000000;")
         self.ax = self.figure.add_subplot(111)
-        self.ax.set_facecolor(BG_PANEL)
+        self.ax.set_facecolor("#000000")
         self.ax.axis("off")
-        layout.addWidget(self.canvas, stretch=1)
+
+        # Canvas + loading overlay share the same space via a stacked
+        # layout, so the spinner appears directly on top of the slice
+        # image instead of needing a separate panel or popup.
+        self.canvas_stack = QStackedLayout()
+        self.canvas_stack.setStackingMode(QStackedLayout.StackAll)
+        canvas_container = QWidget()
+        canvas_container.setLayout(self.canvas_stack)
+        self.canvas_stack.addWidget(self.canvas)
+
+        self.loading_overlay = QWidget()
+        # Lighter than before — the pixelated image itself now carries most
+        # of the visual weight, so a heavy flat black backdrop would just
+        # compete with it instead of framing it.
+        self.loading_overlay.setStyleSheet("background-color: rgba(0, 0, 0, 90);")
+        overlay_stack = QStackedLayout(self.loading_overlay)
+        overlay_stack.setStackingMode(QStackedLayout.StackAll)
+
+        # Base layer: a pixelated snapshot of whatever was last actually
+        # shown in this panel, with block size animating — "the system is
+        # processing this specific image," not just a generic dimmed panel.
+        self.pixelate_effect = PixelateEffect(color=ACCENT_TEAL)
+        overlay_stack.addWidget(self.pixelate_effect)
+
+        # Middle effect: the scan line sweeps top-to-bottom across the
+        # (now pixelated) slice image.
+        self.scan_line = ScanLineSweep(color=ACCENT_TEAL)
+        overlay_stack.addWidget(self.scan_line)
+
+        # Top effect: small arc spinner tucked in the top-right corner,
+        # with the caption anchored at the bottom — this layer's own
+        # background stays transparent so the layers underneath stay
+        # visible everywhere except where these small widgets sit.
+        corner_layer = QWidget()
+        corner_layer.setStyleSheet("background: transparent;")
+        corner_layout = QVBoxLayout(corner_layer)
+        corner_layout.setContentsMargins(10, 10, 10, 10)
+
+        spinner_row = QHBoxLayout()
+        spinner_row.addStretch(1)
+        self.loading_animation = ArcSpinner(diameter=26, color=ACCENT_TEAL_SOFT)
+        spinner_row.addWidget(self.loading_animation)
+        corner_layout.addLayout(spinner_row)
+        corner_layout.addStretch(1)
+
+        self.loading_caption = QLabel("SCANNING")
+        self.loading_caption.setAlignment(Qt.AlignCenter)
+        self.loading_caption.setStyleSheet(
+            f"color: {ACCENT_TEAL_SOFT}; font-size: 10px; font-weight: 600; "
+            f"letter-spacing: 2px; background: transparent; border: none;"
+        )
+        corner_layout.addWidget(self.loading_caption)
+
+        overlay_stack.addWidget(corner_layer)
+
+        self.canvas_stack.addWidget(self.loading_overlay)
+        self.loading_overlay.hide()
+
+        layout.addWidget(canvas_container, stretch=1)
 
         self.slider = QSlider(Qt.Horizontal)
         self.slider.setEnabled(False)
@@ -317,10 +627,33 @@ class SlicePanel(QFrame):
 
         self._base_title = title
 
+    def set_loading(self, active: bool):
+        """Shows/hides the pixelate + scan-line + corner-arc loading
+        animation over the slice image — used while Run segmentation is
+        processing this panel's data."""
+        if active:
+            # Grab whatever's currently on screen (the last-shown slice)
+            # right now, before any of it changes — that's what gets
+            # pixelated for the duration of this loading pass.
+            self.pixelate_effect.set_source(self.canvas.grab())
+            self.loading_overlay.show()
+            self.loading_overlay.raise_()
+            self.pixelate_effect.start()
+            self.scan_line.start()
+            self.loading_animation.start()
+        else:
+            self.pixelate_effect.stop()
+            self.scan_line.stop()
+            self.loading_animation.stop()
+            self.loading_overlay.hide()
+
     def set_volume(self, volume: np.ndarray):
         """volume: 3D numpy array (already normalized for display, 0-1 range)."""
         self.volume = volume
-        self.mask = None  # new volume invalidates any previous mask overlay
+        self.mask = None   # new volume invalidates any previous overlay
+        self.probs = None
+        self.labels = None
+        self.color_map = None
         n_slices = volume.shape[self.axis]
         self.slider.setEnabled(True)
         self.slider.setMinimum(0)
@@ -328,15 +661,46 @@ class SlicePanel(QFrame):
         self.slider.setValue(n_slices // 2)
         self._draw_slice(n_slices // 2)
 
-        self.setStyleSheet(_panel_style(ACCENT_TEAL))
-
     def set_mask(self, mask: np.ndarray):
-        """mask: binary 3D numpy array, same shape as the current volume."""
+        """
+        mask: binary 3D numpy array, same shape as the current volume.
+        Renders as a hard on/off red overlay. Superseded by
+        set_detection() when a probability map + per-component labels
+        are available (see on_run_segmentation) — kept as a fallback API
+        for callers that only have a plain binary mask.
+        """
         if self.volume is not None and mask.shape != self.volume.shape:
             raise ValueError(
                 f"mask shape {mask.shape} does not match volume shape {self.volume.shape}"
             )
         self.mask = mask
+        self.probs = None
+        self.labels = None
+        self.color_map = None
+        self._draw_slice(self.slider.value())
+
+    def set_detection(self, probs: np.ndarray, labels: np.ndarray, color_map: dict):
+        """
+        probs: continuous 0-1 probability array (the model's raw sigmoid
+        output, before thresholding). labels: same-shape int array from
+        connected-component labeling (0=background, 1..N=component id —
+        a brain can have more than one separate lesion). color_map:
+        {component_id: hex_color}, assigning each distinct tumor its own
+        color, matching the same colors used in the report/PDF.
+
+        Blend strength still scales with confidence per voxel (see
+        _draw_slice), but the color itself now depends on which
+        component that voxel belongs to, instead of every tumor
+        rendering in the same flat red.
+        """
+        if self.volume is not None and probs.shape != self.volume.shape:
+            raise ValueError(
+                f"probability map shape {probs.shape} does not match volume shape {self.volume.shape}"
+            )
+        self.probs = probs
+        self.labels = labels
+        self.color_map = color_map
+        self.mask = None  # heatmap supersedes the binary overlay for display
         self._draw_slice(self.slider.value())
 
     def _on_slider_changed(self, index: int):
@@ -356,7 +720,66 @@ class SlicePanel(QFrame):
         img_slice = self._slice_along_axis(self.volume, index)
         rgb = np.stack([img_slice, img_slice, img_slice], axis=-1)
 
-        if self.mask is not None:
+        if self.probs is not None:
+            # Continuous heatmap: blend strength scales with the model's
+            # actual confidence at each voxel, rather than a flat on/off
+            # color. Three things make the gradient actually visible
+            # instead of a flat wash:
+            #   1. A higher floor (0.2) drops low-confidence background
+            #      noise entirely, instead of tinting the whole image
+            #      faintly and diluting the contrast that matters.
+            #   2. A gamma < 1 stretches the remaining 0.2-1.0 range so
+            #      mid-confidence differences are visually distinguishable,
+            #      not compressed into a narrow band near full opacity.
+            #   3. A higher max alpha (0.95) lets fully-confident voxels
+            #      read as strong, clearly-visible color.
+            prob_slice = self._slice_along_axis(self.probs, index)
+            confidence = np.clip(prob_slice, 0.0, 1.0)
+
+            floor = 0.2
+            gamma = 0.55
+            max_alpha = 0.95
+
+            normalized = np.zeros_like(confidence)
+            visible = confidence > floor
+            normalized[visible] = (confidence[visible] - floor) / (1.0 - floor)
+            alpha_all = np.power(normalized, gamma) * max_alpha
+
+            if self.labels is not None and self.color_map:
+                # Color each connected component with its own assigned
+                # color, so separate tumors are visually distinguishable
+                # and match the same colors used in the report.
+                label_slice = self._slice_along_axis(self.labels, index)
+                for label_id, hex_color in self.color_map.items():
+                    comp_rgb = _hex_to_rgb01(hex_color)
+                    comp_region = label_slice == label_id
+                    if not comp_region.any():
+                        continue
+                    a = alpha_all * comp_region
+                    for c in range(3):
+                        rgb[..., c] = np.where(
+                            comp_region, (1 - a) * rgb[..., c] + a * comp_rgb[c], rgb[..., c]
+                        )
+                # Any visible-confidence voxels that ended up outside every
+                # labeled component (shouldn't normally happen, since
+                # labels come from the same mask) still show up in the
+                # default red rather than silently vanishing.
+                labeled_anywhere = label_slice > 0
+                leftover = visible & (~labeled_anywhere)
+                if leftover.any():
+                    a = alpha_all * leftover
+                    default_rgb = (1.0, 0.15, 0.15)
+                    for c in range(3):
+                        rgb[..., c] = np.where(
+                            leftover, (1 - a) * rgb[..., c] + a * default_rgb[c], rgb[..., c]
+                        )
+            else:
+                # No per-component labels available — fall back to the
+                # single flat red heatmap.
+                red = (1.0, 0.15, 0.15)
+                for c in range(3):
+                    rgb[..., c] = (1 - alpha_all) * rgb[..., c] + alpha_all * red[c]
+        elif self.mask is not None:
             mask_slice = self._slice_along_axis(self.mask, index)
             hit = mask_slice > 0.5
             rgb[hit, 0] = 1.0
@@ -377,6 +800,137 @@ class SlicePanel(QFrame):
         self.maximize_btn.setToolTip("Restore" if is_max else "Maximize")
 
 
+def _inject_dark_page_style(html_path: str):
+    """
+    Plotly's write_html doesn't expose the page <body> background directly
+    — only the plot's own paper/plot background, which leaves the HTML
+    page's default white margin visible around the figure if the plot
+    doesn't exactly fill the QWebEngineView. This patches a small <style>
+    block into the generated file so the whole page matches the dark
+    panel instead.
+    """
+    try:
+        path = Path(html_path)
+        content = path.read_text(encoding="utf-8")
+    except OSError:
+        return
+    style_block = (
+        f"<style>html,body{{margin:0;padding:0;background:{BG_PANEL};"
+        f"overflow:hidden;}}</style>"
+    )
+    if "<head>" in content:
+        content = content.replace("<head>", f"<head>{style_block}", 1)
+        try:
+            path.write_text(content, encoding="utf-8")
+        except OSError:
+            pass
+
+
+def _inject_middle_click_pan(html_path: str):
+    """
+    Plotly's 3D scenes support panning natively via right-click-drag, but
+    that fights with the browser's own context menu inside a
+    QWebEngineView. This injects a small script that instead pans on
+    middle-mouse-button drag (holding the scroll wheel down and moving
+    the mouse) — left-drag still rotates and the wheel still zooms,
+    exactly as before, this only adds the missing pan gesture.
+
+    The math: compute the camera's current right and up vectors from its
+    eye/center/up, then translate both eye and center together along
+    those vectors by an amount proportional to the mouse movement — a
+    true pan that keeps the viewing direction unchanged, rather than a
+    rotation.
+    """
+    try:
+        path = Path(html_path)
+        content = path.read_text(encoding="utf-8")
+    except OSError:
+        return
+
+    script_block = """
+<script>
+(function() {
+    function setupMiddleClickPan() {
+        var gd = document.querySelector('.plotly-graph-div');
+        if (!gd) { setTimeout(setupMiddleClickPan, 100); return; }
+
+        var dragging = false;
+        var lastX = 0, lastY = 0;
+        var panScale = 0.0022;
+
+        gd.addEventListener('mousedown', function(e) {
+            if (e.button === 1) {
+                dragging = true;
+                lastX = e.clientX;
+                lastY = e.clientY;
+                e.preventDefault();
+            }
+        });
+
+        window.addEventListener('mouseup', function(e) {
+            if (e.button === 1) { dragging = false; }
+        });
+
+        window.addEventListener('mousemove', function(e) {
+            if (!dragging) return;
+            e.preventDefault();
+
+            var dx = e.clientX - lastX;
+            var dy = e.clientY - lastY;
+            lastX = e.clientX;
+            lastY = e.clientY;
+
+            var layout = gd._fullLayout;
+            var scene = layout && layout.scene;
+            var camera = scene && scene.camera;
+            if (!camera) return;
+
+            var eye = camera.eye;
+            var center = camera.center || {x: 0, y: 0, z: 0};
+            var up = camera.up || {x: 0, y: 0, z: 1};
+
+            var fx = center.x - eye.x, fy = center.y - eye.y, fz = center.z - eye.z;
+            var flen = Math.sqrt(fx * fx + fy * fy + fz * fz) || 1;
+            fx /= flen; fy /= flen; fz /= flen;
+
+            var rx = fy * up.z - fz * up.y;
+            var ry = fz * up.x - fx * up.z;
+            var rz = fx * up.y - fy * up.x;
+            var rlen = Math.sqrt(rx * rx + ry * ry + rz * rz) || 1;
+            rx /= rlen; ry /= rlen; rz /= rlen;
+
+            var ux = ry * fz - rz * fy;
+            var uy = rz * fx - rx * fz;
+            var uz = rx * fy - ry * fx;
+
+            var dxp = -dx * panScale;
+            var dyp = dy * panScale;
+
+            var moveX = rx * dxp + ux * dyp;
+            var moveY = ry * dxp + uy * dyp;
+            var moveZ = rz * dxp + uz * dyp;
+
+            Plotly.relayout(gd, {
+                'scene.camera.eye': {x: eye.x + moveX, y: eye.y + moveY, z: eye.z + moveZ},
+                'scene.camera.center': {x: center.x + moveX, y: center.y + moveY, z: center.z + moveZ}
+            });
+        });
+    }
+    setupMiddleClickPan();
+})();
+</script>
+"""
+    if "</body>" in content:
+        content = content.replace("</body>", f"{script_block}</body>", 1)
+    else:
+        content += script_block
+
+    try:
+        path.write_text(content, encoding="utf-8")
+    except OSError:
+        pass
+
+
 class Panel3D(QFrame):
     """
     A bordered panel that shows an interactive 3D Plotly figure (rotate,
@@ -391,6 +945,9 @@ class Panel3D(QFrame):
         super().__init__()
         self.accent = accent
         self.setFrameShape(QFrame.Box)
+        # No border at all, active or not — unlike the 2D panels, the 3D
+        # panels stay borderless; the accent color is used elsewhere
+        # (e.g. tumor-panel labeling) instead of as a frame outline here.
         self.setStyleSheet(_panel_style())
         self.setMinimumHeight(min_height)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
@@ -428,19 +985,29 @@ class Panel3D(QFrame):
         if self.web_view is None:
             self.placeholder_label.hide()
             self.web_view = QWebEngineView()
+            # A transparent-looking background on the QWebEngineView itself
+            # so there's no flash of default white before the page loads.
+            self.web_view.setStyleSheet(f"background-color: {BG_PANEL}; border: none;")
             self._layout.addWidget(self.web_view, stretch=1)
+
+        # Hide Plotly's icon toolbar (zoom/pan/camera/reset buttons) — the
+        # panel is still fully interactive via mouse drag/scroll, just
+        # without the visible icon strip.
+        config = {**INTERACTION_CONFIG, "displayModeBar": False}
 
         tmp = tempfile.NamedTemporaryFile(suffix=".html", delete=False)
         fig.write_html(
             tmp.name,
             include_plotlyjs=True,
             full_html=True,
-            config=INTERACTION_CONFIG,
+            config=config,
+            default_width="100%",
+            default_height="100%",
         )
+        _inject_dark_page_style(tmp.name)
+        _inject_middle_click_pan(tmp.name)
         self._temp_files.append(tmp.name)
         self.web_view.load(QUrl.fromLocalFile(tmp.name))
-
-        self.setStyleSheet(_panel_style(self.accent))
 
     def set_maximized(self, is_max: bool):
         """Swaps the button glyph/tooltip; actual show/hide of sibling
@@ -555,6 +1122,7 @@ class MainWindow(QMainWindow):
             self._survival_table = load_survival_days()
         except (FileNotFoundError, KeyError):
             self._survival_table = {}
+        self._current_report: Optional[dict] = None
 
         central = QWidget()
 
@@ -609,6 +1177,44 @@ class MainWindow(QMainWindow):
 
         self.patients_record_panel = PatientRecordPanel(min_height=150)
         left.addWidget(self.patients_record_panel)
+
+        # Report summary — built only from what this single whole-tumor
+        # mask can honestly support, plus the survival prediction the
+        # patients-record panel already computed. Left-aligned body text,
+        # unlike the centered titles on the 2D/3D panels, since this is
+        # read top-to-bottom like a small document rather than glanced at
+        # like a chart title.
+        self.report_frame = QFrame()
+        self.report_frame.setStyleSheet(_panel_style())
+        self.report_frame.setMinimumHeight(150)
+        report_layout = QVBoxLayout(self.report_frame)
+        report_layout.setContentsMargins(SPACING, SPACING, SPACING, SPACING)
+        report_layout.setSpacing(6)
+
+        report_title = QLabel("Report summary")
+        report_title.setStyleSheet(f"border: none; color: {TEXT_LIGHT}; font-size: 13px; font-weight: 600;")
+        report_layout.addWidget(report_title)
+
+        self.report_body_label = QLabel("Run segmentation to generate a report.")
+        self.report_body_label.setWordWrap(True)
+        self.report_body_label.setStyleSheet(f"border: none; color: {TEXT_MUTED}; font-size: 11px;")
+        report_layout.addWidget(self.report_body_label)
+        report_layout.addStretch()
+
+        left.addWidget(self.report_frame)
+
+        self.export_report_btn = QPushButton("Export PDF report")
+        self.export_report_btn.setEnabled(False)
+        self.export_report_btn.setStyleSheet(
+            f"QPushButton {{ border: none; border-radius: 14px; "
+            f"padding: 10px {SPACING}px; background-color: {BG_PANEL}; color: {ACCENT_TEAL}; font-weight: 500; }}"
+            f"QPushButton:hover {{ background-color: #3a3a3c; }}"
+            f"QPushButton:pressed {{ background-color: #48484a; }}"
+            f"QPushButton:disabled {{ color: {TEXT_MUTED}; }}"
+        )
+        self.export_report_btn.clicked.connect(self.on_export_report)
+        left.addWidget(self.export_report_btn)
+
         left.addStretch()
 
         self.left_container = QWidget()
@@ -741,15 +1347,17 @@ class MainWindow(QMainWindow):
             return
 
         self.busy_bar.show()
+        self._set_2d_loading(True)
         self.status_label.setText("Running segmentation...")
         QApplication.processEvents()  # let the UI repaint before the model blocks
 
         try:
-            mask, predicted_days = self._run_model(
+            mask, probs, predicted_days = self._run_model(
                 model, model_input, target_shape=display_volume.shape
             )
         except Exception as exc:
             self.busy_bar.hide()
+            self._set_2d_loading(False)
             QMessageBox.critical(self, "Inference failed", str(exc))
             self.status_label.setText("")
             return
@@ -757,17 +1365,74 @@ class MainWindow(QMainWindow):
         self.sagittal_panel.set_volume(display_volume)
         self.axial_panel.set_volume(display_volume)
         self.coronal_panel.set_volume(display_volume)
-        self.sagittal_panel.set_mask(mask)
-        self.axial_panel.set_mask(mask)
-        self.coronal_panel.set_mask(mask)
 
         voxel_vol_cm3 = self._voxel_volume_cm3(affine)
+        labels, components, color_map = self._label_tumor_components(mask, probs, voxel_vol_cm3)
+
+        self.sagittal_panel.set_detection(probs, labels, color_map)
+        self.axial_panel.set_detection(probs, labels, color_map)
+        self.coronal_panel.set_detection(probs, labels, color_map)
+        self._set_2d_loading(False)
+
         tumor_cm3 = float(mask.sum()) * voxel_vol_cm3
         self.status_label.setText(f"Tumor volume: {tumor_cm3:.2f} cm\u00b3")
         self.patients_record_panel.set_predictions(predicted_days, tumor_cm3)
 
+        report = self._compute_report(mask, probs, display_volume, affine, predicted_days, components)
+        self._update_report_panel(report)
+
         self._update_3d_views(display_volume, mask, affine)
         self.busy_bar.hide()
+
+    def _label_tumor_components(self, mask: np.ndarray, probs: np.ndarray, voxel_vol_cm3: float):
+        """
+        Splits the binary mask into separate connected components — a
+        brain can have more than one lesion — and assigns each a distinct
+        color from COMPONENT_PALETTE, largest volume first, so the same
+        color consistently identifies the same tumor across the 2D
+        heatmap, the report panel, and the PDF export.
+
+        Returns (labels, components, color_map):
+            labels:     int array, same shape as mask (0=background, 1..N=component id)
+            components: list of dicts, sorted largest-first, each with
+                        label_id, voxels, volume_cm3, confidence, rank,
+                        color_name, color_hex
+            color_map:  {label_id: hex_color}, for passing straight into
+                        SlicePanel.set_detection()
+        """
+        labels, n_components = ndi_label(mask > 0.5)
+
+        entries = []
+        for label_id in range(1, n_components + 1):
+            comp_mask = labels == label_id
+            voxels = int(comp_mask.sum())
+            if voxels == 0:
+                continue
+            entries.append({
+                "label_id": label_id,
+                "voxels": voxels,
+                "volume_cm3": voxels * voxel_vol_cm3,
+                "confidence": float(probs[comp_mask].mean()),
+            })
+
+        # Largest first, so "#1" consistently means the biggest lesion
+        # rather than an arbitrary scan-order label id.
+        entries.sort(key=lambda e: e["volume_cm3"], reverse=True)
+
+        color_map = {}
+        for rank, entry in enumerate(entries):
+            color_name, color_hex = COMPONENT_PALETTE[rank % len(COMPONENT_PALETTE)]
+            entry["rank"] = rank + 1
+            entry["color_name"] = color_name
+            entry["color_hex"] = color_hex
+            color_map[entry["label_id"]] = color_hex
+
+        return labels, entries, color_map
+
+    def _set_2d_loading(self, active: bool):
+        """Shows/hides the spinner overlay on all three 2D panels at once."""
+        for panel in self.center_panels:
+            panel.set_loading(active)
 
     def _update_3d_views(
         self,
@@ -862,6 +1527,13 @@ class MainWindow(QMainWindow):
         d_min, d_max = float(flair.min()), float(flair.max())
         display_volume = (flair - d_min) / (d_max - d_min) if d_max > d_min else flair
 
+        # Standardize to a fixed shape so every case displays at consistent
+        # size/proportions regardless of native resolution. The mask that
+        # comes back from the model will be upsampled to this same
+        # standardized shape (see on_run_segmentation/_run_model), so it
+        # stays pixel-aligned with this display volume automatically.
+        display_volume, affine = _standardize_volume(display_volume, affine)
+
         # Same per-volume z-score the training dataset uses, stacked in the
         # same channel order as config.MODALITIES.
         channels = [_normalize(arrays[key]) for key in MODALITIES]
@@ -896,7 +1568,10 @@ class MainWindow(QMainWindow):
     def _run_model(self, model, model_input: torch.Tensor, target_shape: tuple):
         """
         Resize the input to INFERENCE_SIZE, run both heads, upsample the
-        probability map back to native resolution, and return (mask, days).
+        probability map back to native resolution, and return
+        (mask, probs, days). `probs` is the raw sigmoid output (0-1 per
+        voxel) — kept rather than discarded after thresholding, so the UI
+        can show actual model confidence instead of a hard yes/no mask.
         """
         device = self._device
         x = model_input.to(device)
@@ -913,7 +1588,8 @@ class MainWindow(QMainWindow):
         probs_native = torch.nn.functional.interpolate(
             probs, size=target_shape, mode="trilinear", align_corners=False
         )
-        mask = (probs_native > 0.5).float().squeeze(0).squeeze(0).cpu().numpy()
+        probs_np = probs_native.squeeze(0).squeeze(0).cpu().numpy()
+        mask = (probs_np > 0.5).astype(np.float32)
 
         predicted_days = None
         if self._survival_stats is not None:
@@ -927,7 +1603,7 @@ class MainWindow(QMainWindow):
             except AttributeError:
                 predicted_days = None
 
-        return mask, predicted_days
+        return mask, probs_np, predicted_days
 
     @staticmethod
     def _voxel_volume_cm3(affine: np.ndarray) -> float:
@@ -935,6 +1611,258 @@ class MainWindow(QMainWindow):
         voxel_dims_mm = np.sqrt((affine[:3, :3] ** 2).sum(axis=0))
         voxel_volume_mm3 = float(np.prod(voxel_dims_mm))
         return voxel_volume_mm3 / 1000.0
+
+    def _compute_report(
+        self,
+        mask: np.ndarray,
+        probs: np.ndarray,
+        display_volume: np.ndarray,
+        affine: np.ndarray,
+        predicted_days: Optional[float],
+        components: list,
+    ) -> dict:
+        """
+        Builds the metrics a single whole-tumor binary mask can honestly
+        support. This model predicts one class only, so tumor core and
+        edema are NOT included here — those need a retrained multi-class
+        (WT/TC/ET) model, since they can't be derived from a single mask
+        after the fact. Predicted survival is included since the
+        multi-task model already computes it separately.
+
+        `avg_confidence` is the mean of the model's raw sigmoid output
+        (probs) across only the voxels included in the mask — it reflects
+        how sure the model was about the region it flagged, not an
+        independently validated or calibrated probability. `components`
+        is the same per-tumor list from _label_tumor_components(), passed
+        in rather than recomputed here, since the caller already needs it
+        for the 2D heatmap coloring.
+        """
+        voxel_vol_cm3 = self._voxel_volume_cm3(affine)
+        total_voxels = int(mask.sum())
+        total_cm3 = total_voxels * voxel_vol_cm3
+        n_components = len(components)
+
+        if total_voxels > 0:
+            centroid = np.array(ndi_center_of_mass(mask))
+            shape = np.array(mask.shape)
+            rel = (centroid - shape / 2.0) / (shape / 2.0)  # -1..1 per axis
+
+            # Assumes BraTS-style axis ordering (0=L-R, 1=A-P, 2=S-I), same
+            # assumption already used for the sagittal/coronal/axial panels.
+            # This isn't verified against the file's own orientation, so
+            # it's a rough geometric description relative to the volume's
+            # center, not a clinically confirmed laterality reading.
+            lr = "right" if rel[0] > 0.1 else ("left" if rel[0] < -0.1 else "midline")
+            ap = "posterior" if rel[1] > 0.1 else ("anterior" if rel[1] < -0.1 else "central")
+            si = "superior" if rel[2] > 0.1 else ("inferior" if rel[2] < -0.1 else "central")
+            location = f"{lr}, {ap}, {si} (approximate)"
+            avg_confidence = float(probs[mask > 0.5].mean())
+        else:
+            location = "n/a — no tumor voxels detected"
+            avg_confidence = float("nan")
+
+        try:
+            brain_level = brain_surface_level(display_volume)
+            brain_voxels = int((display_volume > brain_level).sum())
+            percent_of_brain = (total_voxels / brain_voxels * 100.0) if brain_voxels > 0 else float("nan")
+        except ValueError:
+            percent_of_brain = float("nan")
+
+        return {
+            "total_cm3": total_cm3,
+            "n_components": n_components,
+            "location": location,
+            "percent_of_brain": percent_of_brain,
+            "predicted_days": predicted_days,
+            "avg_confidence": avg_confidence,
+            "components": components,
+        }
+
+    def _update_report_panel(self, report: dict):
+        self._current_report = report
+        lines = [
+            f"Total lesion volume: {report['total_cm3']:.2f} cm&sup3;",
+            f"Lesion components: {report['n_components']}",
+            f"Approx. location: {report['location']}",
+        ]
+        if not np.isnan(report["percent_of_brain"]):
+            lines.append(f"% of brain volume: {report['percent_of_brain']:.1f}%")
+
+        components = report.get("components") or []
+        if components:
+            # Per-tumor confidence, listed by the same color used in the
+            # 2D heatmap — a colored dot next to each entry, not just a
+            # color name, so the report and the image visually match at a
+            # glance.
+            lines.append("<br><b>Confidence by tumor:</b>")
+            for comp in components:
+                swatch = f"<span style='color:{comp['color_hex']};'>&#9679;</span>"
+                lines.append(
+                    f"{swatch} {comp['color_name']} (#{comp['rank']}): "
+                    f"{comp['confidence'] * 100:.1f}% conf., {comp['volume_cm3']:.2f} cm&sup3;"
+                )
+        elif not np.isnan(report.get("avg_confidence", float("nan"))):
+            lines.append(f"Avg. model confidence: {report['avg_confidence'] * 100:.1f}%")
+
+        if report.get("predicted_days") is not None:
+            lines.append(f"Predicted survival: {format_survival(report['predicted_days'])}")
+
+        self.report_body_label.setTextFormat(Qt.RichText)
+        self.report_body_label.setText("<br>".join(lines))
+        self.export_report_btn.setEnabled(True)
+
+    def on_export_report(self):
+        if not self._current_report:
+            return
+
+        default_name = f"{self.current_folder.name if self.current_folder else 'patient'}_report.pdf"
+        path, _ = QFileDialog.getSaveFileName(self, "Save PDF report", default_name, "PDF files (*.pdf)")
+        if not path:
+            return
+
+        try:
+            self._export_pdf(path, self._current_report)
+        except Exception as exc:
+            QMessageBox.critical(self, "Failed to export report", str(exc))
+            return
+
+        QMessageBox.information(self, "Report exported", f"Saved to:\n{path}")
+
+    def _export_pdf(self, path: str, report: dict):
+        """
+        Builds a one-page PDF summary using reportlab. Kept as a local
+        import since this is the only place in the file that needs it —
+        matches the "load heavy dependencies where they're used" pattern
+        already used for the MONAI-adjacent model imports elsewhere.
+        """
+        from reportlab.lib import colors
+        from reportlab.lib.pagesizes import letter
+        from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+        from reportlab.lib.units import inch
+        from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+
+        doc = SimpleDocTemplate(path, pagesize=letter, topMargin=0.6 * inch, bottomMargin=0.6 * inch)
+        styles = getSampleStyleSheet()
+        title_style = ParagraphStyle("TitleCustom", parent=styles["Title"], fontSize=16)
+        disclaimer_style = ParagraphStyle(
+            "Disclaimer", parent=styles["Normal"], fontSize=8, textColor=colors.HexColor("#8a1c1c")
+        )
+
+        disclaimer = (
+            "This report is generated by an automated research pipeline and is NOT a "
+            "diagnostic or clinical report. It has not been reviewed by a radiologist. "
+            "The current model predicts whole-tumor extent only \u2014 tumor core and edema "
+            "sub-regions are not available without a retrained multi-class model. Location "
+            "is a rough geometric estimate relative to the volume center, not a confirmed "
+            "anatomical reading. Predicted survival is a model estimate, not a clinical "
+            "prognosis. Model confidence is the average of the model's own raw output "
+            "probability within the flagged region \u2014 it has not been independently "
+            "calibrated or validated, and should not be read as a statistically precise "
+            "likelihood."
+        )
+
+        story = [
+            Paragraph("Brain Tumor Segmentation \u2014 Report Summary", title_style),
+            Spacer(1, 4),
+            Paragraph(disclaimer, disclaimer_style),
+            Spacer(1, 14),
+        ]
+
+        patient_code = self.current_folder.name if self.current_folder else "unknown"
+        meta_table = Table(
+            [
+                ["Patient / case folder", patient_code],
+                ["Report generated", datetime.now().strftime("%Y-%m-%d %H:%M")],
+            ],
+            colWidths=[2 * inch, 4 * inch],
+        )
+        meta_table.setStyle(TableStyle([
+            ("FONTSIZE", (0, 0), (-1, -1), 10),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+            ("TEXTCOLOR", (0, 0), (0, -1), colors.grey),
+        ]))
+        story.append(meta_table)
+        story.append(Spacer(1, 16))
+
+        story.append(Paragraph("Metrics", styles["Heading2"]))
+        percent_text = (
+            f"{report['percent_of_brain']:.1f}%" if not np.isnan(report["percent_of_brain"]) else "n/a"
+        )
+        confidence_text = (
+            f"{report['avg_confidence'] * 100:.1f}%"
+            if not np.isnan(report.get("avg_confidence", float("nan")))
+            else "n/a"
+        )
+        survival_text = (
+            format_survival(report["predicted_days"])
+            if report.get("predicted_days") is not None
+            else "n/a"
+        )
+        metric_table = Table(
+            [
+                ["Metric", "Value"],
+                ["Total lesion volume", f"{report['total_cm3']:.2f} cm\u00b3"],
+                ["Lesion components", str(report["n_components"])],
+                ["Approximate location", report["location"]],
+                ["% of brain volume", percent_text],
+                ["Avg. model confidence", confidence_text],
+                ["Predicted survival", survival_text],
+            ],
+            colWidths=[2.5 * inch, 3 * inch],
+        )
+        metric_table.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#2c3e50")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("FONTSIZE", (0, 0), (-1, -1), 10),
+            ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f2f2f2")]),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+            ("TOPPADDING", (0, 0), (-1, -1), 6),
+        ]))
+        story.append(metric_table)
+
+        components = report.get("components") or []
+        if components:
+            story.append(Spacer(1, 16))
+            story.append(Paragraph("Confidence by Tumor", styles["Heading2"]))
+            story.append(Paragraph(
+                "Colors distinguish separate lesions from each other for reference "
+                "across this report and the app's image views \u2014 they are not a "
+                "standardized clinical color scheme.",
+                disclaimer_style,
+            ))
+            story.append(Spacer(1, 6))
+
+            comp_rows = [["#", "Color", "Confidence", "Volume"]]
+            comp_style_commands = [
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#2c3e50")),
+                ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                ("FONTSIZE", (0, 0), (-1, -1), 10),
+                ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+                ("TOPPADDING", (0, 0), (-1, -1), 6),
+            ]
+            for row_index, comp in enumerate(components, start=1):
+                comp_rows.append([
+                    str(comp["rank"]),
+                    comp["color_name"],
+                    f"{comp['confidence'] * 100:.1f}%",
+                    f"{comp['volume_cm3']:.2f} cm\u00b3",
+                ])
+                # Tint the Color cell with the tumor's actual assigned
+                # color, so the table visually matches the app's heatmap.
+                comp_style_commands.append(
+                    ("BACKGROUND", (1, row_index), (1, row_index), colors.HexColor(comp["color_hex"]))
+                )
+                comp_style_commands.append(
+                    ("TEXTCOLOR", (1, row_index), (1, row_index), colors.white)
+                )
+
+            comp_table = Table(comp_rows, colWidths=[0.5 * inch, 1.5 * inch, 1.5 * inch, 1.5 * inch])
+            comp_table.setStyle(TableStyle(comp_style_commands))
+            story.append(comp_table)
+
+        doc.build(story)
 
     def on_enter_image(self):
         folder = QFileDialog.getExistingDirectory(self, "Select patient folder")
@@ -1007,7 +1935,8 @@ class MainWindow(QMainWindow):
     def _load_volume(path: str):
         """
         Loads a NIfTI file and returns a normalized 3D numpy array ready for
-        display (values roughly 0-1) plus the affine for 3D voxel spacing.
+        display (values roughly 0-1, resampled to STANDARD_DISPLAY_SHAPE)
+        plus a matching affine for 3D voxel spacing.
         """
         img = nib.load(path)
         data = img.get_fdata()
@@ -1023,7 +1952,7 @@ class MainWindow(QMainWindow):
         d_min, d_max = float(data.min()), float(data.max())
         if d_max > d_min:
             data = (data - d_min) / (d_max - d_min)
-        return data, img.affine
+        return _standardize_volume(data, img.affine)
 
 
 def main():
